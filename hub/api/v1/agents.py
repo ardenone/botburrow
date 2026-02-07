@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from botburrow_hub.auth import verify_admin_token, verify_agent_api_key
 from botburrow_hub.config import settings
-from botburrow_hub.database import Agent, AgentRepository
+from botburrow_hub.database import Agent, AgentRepository, get_session
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -82,6 +82,30 @@ class AgentListResponse(BaseModel):
     total: int
     offset: int
     limit: int
+
+
+class RegenerateKeyRequest(BaseModel):
+    """Request to regenerate API key."""
+
+    grace_period_hours: int = Field(
+        default=24,
+        ge=0,
+        le=168,
+        description="Grace period in hours for old key to remain valid (0-168, default 24)"
+    )
+    new_expires_at: Optional[str] = Field(
+        None,
+        description="New API key expiration timestamp (ISO 8601). If not provided, key does not expire."
+    )
+
+
+class RegenerateKeyResponse(BaseModel):
+    """Response to API key regeneration."""
+
+    api_key: str
+    api_key_expires_at: Optional[str] = None
+    old_key_expires_at: str
+    message: str = "API key regenerated successfully"
 
 
 class HealthResponse(BaseModel):
@@ -188,6 +212,98 @@ async def get_own_profile(
         is_admin=agent.is_admin,
         created_at=agent.created_at.isoformat() if agent.created_at else None,
         updated_at=agent.updated_at.isoformat() if agent.updated_at else None,
+    )
+
+
+@router.post(
+    "/me/regenerate-key",
+    response_model=RegenerateKeyResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def regenerate_api_key(
+    request: RegenerateKeyRequest,
+    agent: Agent = Depends(verify_agent_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> RegenerateKeyResponse:
+    """Regenerate the authenticated agent's API key.
+
+    This endpoint allows an agent to rotate its own API key with zero downtime.
+    The old key remains valid for a configurable grace period to allow
+    seamless transition.
+
+    The flow:
+    1. Generate a new API key
+    2. Store old key hash in api_key_history with grace period
+    3. Update agent's api_key_hash to new value
+
+    During the grace period, both the old and new keys are valid.
+
+    Requires authentication via Bearer token (agent API key).
+    """
+    from datetime import timedelta
+
+    # Calculate grace period expiration
+    grace_period_expires_at = datetime.now() + timedelta(hours=request.grace_period_hours)
+
+    # Parse new expiration if provided
+    new_expires_at = None
+    if request.new_expires_at:
+        try:
+            new_expires_at = datetime.fromisoformat(request.new_expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid new_expires_at format. Use ISO 8601 format.",
+            )
+
+    # Generate new API key
+    new_api_key = generate_api_key()
+    new_api_key_hash = hash_api_key(new_api_key)
+
+    # Store old key hash for reference before update
+    old_key_hash = agent.api_key_hash
+
+    # Update the API key using the repository
+    agent_repo = AgentRepository(session)
+    try:
+        updated_agent = await agent_repo.update_api_key(
+            agent_id=agent.id,
+            new_api_key_hash=new_api_key_hash,
+            old_key_hash=old_key_hash,
+            grace_period_expires_at=grace_period_expires_at,
+        )
+
+        # Update api_key_expires_at if provided
+        if new_expires_at is not None:
+            updated_agent.api_key_expires_at = new_expires_at
+
+        await session.commit()
+
+        logger.info(
+            f"API key regenerated for agent {agent.name} "
+            f"(grace period: {request.grace_period_hours}h)"
+        )
+
+    except ValueError as e:
+        # This occurs if the old key hash doesn't match (concurrent modification)
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        )
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Error regenerating API key for agent {agent.name}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to regenerate API key",
+        )
+
+    return RegenerateKeyResponse(
+        api_key=new_api_key,
+        api_key_expires_at=updated_agent.api_key_expires_at.isoformat() if updated_agent.api_key_expires_at else None,
+        old_key_expires_at=grace_period_expires_at.isoformat(),
+        message="API key regenerated successfully",
     )
 
 
