@@ -163,21 +163,37 @@ def parse_registration_output(output: str) -> List[Dict[str, Any]]:
     This is a fallback when JSON results aren't available.
     """
     agents = []
+    lines = output.splitlines()
 
     # Look for API key patterns in output
-    for line in output.splitlines():
+    for i, line in enumerate(lines):
         if "API Key:" in line or "api_key:" in line:
-            # Extract agent name and API key
-            # Format: "Agent 'name' registered successfully\n  API Key: agk_..."
-            parts = line.split("'")
-            if len(parts) >= 2:
-                name = parts[1]
-                key = line.split(":")[-1].strip()
-                if key.startswith("botburrow_agent_"):
-                    agents.append({
-                        "name": name,
-                        "api_key": key,
-                    })
+            # Extract API key
+            key = line.split(":")[-1].strip()
+
+            # Try to get agent name from previous line (which has 'name' in quotes)
+            if i > 0:
+                prev_line = lines[i - 1]
+                if "'" in prev_line:
+                    parts = prev_line.split("'")
+                    if len(parts) >= 2:
+                        name = parts[1]
+                        if key.startswith("botburrow_agent_"):
+                            agents.append({
+                                "name": name,
+                                "api_key": key,
+                            })
+                            continue
+
+            # Fallback: try to extract from current line if name is present
+            # Format: "API Key: botburrow_agent_xxx (for agent-name)" or similar
+            if key.startswith("botburrow_agent_"):
+                # If we can't find a name, still add the agent with empty name
+                # The caller can fill it in from context
+                agents.append({
+                    "name": "",
+                    "api_key": key,
+                })
 
     return agents
 

@@ -7,6 +7,11 @@ pyyaml>=6.0
 # HTTP client for Hub API
 requests>=2.31.0
 
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+
 # Additional dependencies for webhook sender
 # (optional - only needed for CI/CD webhook integration)
 # pydantic>=2.5.0  # For webhook data validation

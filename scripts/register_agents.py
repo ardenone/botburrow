@@ -499,7 +499,8 @@ class AgentRegistrar:
             logger.info(f"Agent '{config.name}' registered successfully")
             logger.info(f"  API Key: {result.get('api_key', 'N/A')}")
             return result
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
+            # Handle both request exceptions and other errors
             logger.error(f"Failed to register agent '{config.name}': {e}")
             if hasattr(e, "response") and e.response is not None:
                 logger.error(f"  Response: {e.response.text}")
@@ -520,7 +521,7 @@ class AgentRegistrar:
             url = f"{self.hub_url}/api/v1/health"
             response = session.get(url, timeout=5)
             return response.status_code == 200
-        except requests.exceptions.RequestException:
+        except Exception:
             return False
 
 
