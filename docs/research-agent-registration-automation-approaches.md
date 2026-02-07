@@ -1,7 +1,8 @@
 # Research: Automated Agent Registration in CI/CD - Approaches Comparison
 
 **Research Date:** 2026-02-07
-**Related Bead:** bd-123 (Alternative: Research and document options)
+**Updated:** 2026-02-07
+**Related Bead:** bd-bd9 (Alternative: Research and document options)
 **Original Bead:** bd-3ul - Implement automated agent registration in CI/CD
 
 ## Executive Summary
@@ -246,29 +247,86 @@ No Hub registration required
 
 ---
 
+### Approach 5: Simplified CI/CD Automation (Minimal Viable)
+
+**Status:** ✅ Implemented as alternative to full workflow
+
+**Description:** Minimal CI/CD automation with reduced complexity.
+
+**Workflow:**
+```
+Push to agent-definitions repo
+  ↓
+CI/CD workflow triggered automatically
+  ↓
+Validate agent configurations (PR: dry-run, Main: full)
+  ↓
+On main branch: Register with Hub API
+  ↓
+Registration complete (API keys displayed in logs)
+```
+
+**Components:**
+- Simplified GitHub Actions workflow (`.github/workflows/agent-registration-simple.yml`)
+- Simplified Forgejo Actions workflow (`.forgejo/workflows/agent-registration-simple.yml`)
+- Hub API integration
+- Basic validation
+
+**Advantages:**
+- ✅ Fully automated - push and done
+- ✅ Minimal setup (only HUB_ADMIN_KEY secret required)
+- ✅ PR validation prevents broken configs
+- ✅ Single combined job (validate + register)
+- ✅ No kubeseal dependency
+- ✅ No webhook setup required
+
+**Disadvantages:**
+- ❌ No automatic SealedSecret generation
+- ❌ No PR comments with validation reports
+- ❌ No artifact uploads
+- ❌ API keys shown in CI logs (though masked)
+- ❌ Manual secret creation required
+
+**Setup Requirements:**
+1. Add `HUB_ADMIN_KEY` to repository secrets
+2. (Optional) Configure `HUB_URL` repository variable
+3. Enable simplified workflow in repository
+
+**When to Use:**
+- Quick CI/CD setup without complex dependencies
+- Teams comfortable with manual secret management
+- Projects that don't need PR validation comments
+- Lower complexity requirements than full automation
+
+**File Locations:**
+- GitHub: `.github/workflows/agent-registration-simple.yml`
+- Forgejo: `.forgejo/workflows/agent-registration-simple.yml`
+
+---
+
 ## Comparison Matrix
 
-| Aspect | Full CI/CD | Manual Workaround | Hybrid Semi-Auto | GitOps-Only |
-|--------|-----------|-------------------|------------------|-------------|
-| **Automation Level** | Full | Manual | Partial | Full (git-synced) |
-| **Setup Complexity** | Medium | Low | Medium | High |
-| **Secret Management** | Automated SealedSecrets | Manual kubeseal | External/separate | Encrypted in git |
-| **PR Validation** | ✅ Yes | ❌ No | ✅ Yes | ✅ Yes |
-| **Error Handling** | Automated | Manual | Semi-automated | Automated |
-| **Multi-Repo Support** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes |
-| **CI/CD Required** | ✅ Yes | ❌ No | ✅ Yes | ❌ No (ArgoCD only) |
-| **Hub API Required** | ✅ Yes | ✅ Yes | ✅ Yes | ❌ No |
-| **Architecture Changes** | ❌ No | ❌ No | ❌ No | ✅ Yes |
-| **Implementation Status** | ✅ Done | ✅ Done | ❌ Not done | ❌ Not done |
-| **Best For** | Production | Quick setups | Complex orgs | Pure GitOps |
+| Aspect | Full CI/CD | Simplified CI/CD | Manual Workaround | Hybrid Semi-Auto | GitOps-Only |
+|--------|-----------|------------------|-------------------|------------------|-------------|
+| **Automation Level** | Full | Full | Manual | Partial | Full (git-synced) |
+| **Setup Complexity** | Medium | Low | Low | Medium | High |
+| **Secret Management** | Automated SealedSecrets | Manual (API in logs) | Manual kubeseal | External/separate | Encrypted in git |
+| **PR Validation** | ✅ Yes + Comments | ✅ Yes (no comments) | ❌ No | ✅ Yes | ✅ Yes |
+| **Error Handling** | Automated | Automated | Manual | Semi-automated | Automated |
+| **Multi-Repo Support** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes |
+| **CI/CD Required** | ✅ Yes | ✅ Yes | ❌ No | ✅ Yes | ❌ No (ArgoCD only) |
+| **Hub API Required** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | ❌ No |
+| **Architecture Changes** | ❌ No | ❌ No | ❌ No | ❌ No | ✅ Yes |
+| **Implementation Status** | ✅ Done | ✅ Done | ✅ Done | ❌ Not done | ❌ Not done |
+| **Best For** | Production | Quick CI/CD setup | Quick setups | Complex orgs | Pure GitOps |
 
 ## Security Comparison
 
-| Security Aspect | Full CI/CD | Manual Workaround | Hybrid | GitOps-Only |
-|-----------------|-----------|-------------------|--------|--------------|
-| API Key Exposure | ❌ CI logs (masked) | ⚠️ Terminal display | ⚠️ Depends on external | ✅ Encrypted in git |
-| Secret Storage | ✅ SealedSecrets | ⚠️ Manual (error-prone) | ⚠️ External | ✅ Encrypted |
-| Access Control | ✅ CI/CD permissions | ✅ Admin key only | ✅ CI + external | ✅ Git permissions |
+| Security Aspect | Full CI/CD | Simplified CI/CD | Manual Workaround | Hybrid | GitOps-Only |
+|-----------------|-----------|------------------|-------------------|--------|--------------|
+| API Key Exposure | ❌ CI logs (masked) | ⚠️ CI logs (visible) | ⚠️ Terminal display | ⚠️ Depends on external | ✅ Encrypted in git |
+| Secret Storage | ✅ SealedSecrets | ⚠️ Manual required | ⚠️ Manual (error-prone) | ⚠️ External | ✅ Encrypted |
+| Access Control | ✅ CI/CD permissions | ✅ CI/CD permissions | ✅ Admin key only | ✅ CI + external | ✅ Git permissions |
 | Audit Trail | ✅ CI logs + git | ⚠️ Terminal only | ✅ CI + external | ✅ Git only |
 | Key Rotation | ✅ Automated (future) | ⚠️ Manual | ✅ External handles | ✅ Git commit |
 
@@ -378,6 +436,13 @@ Justification:
 - ✅ Learning the system
 - ✅ Don't want PR validation gates
 
+### Choose Simplified CI/CD if:
+- ✅ Want CI/CD automation with minimal setup
+- ✅ Comfortable with manual secret management
+- ✅ Don't need PR validation comments
+- ✅ Quick path to automation
+- ✅ No kubeseal/webhook complexity
+
 ### Choose Hybrid if:
 - ✅ External secret manager required
 - ✅ Regulatory segregation of duties
@@ -389,6 +454,7 @@ Justification:
 | Approach | Implementation Cost | Maintenance Cost | Security Benefit | Automation Benefit |
 |----------|---------------------|------------------|------------------|-------------------|
 | Full CI/CD | Low (done) | Low | High | High |
+| Simplified CI/CD | Very Low (done) | Low | Medium | High |
 | Manual | Zero | Medium (manual steps) | Medium | Low |
 | Hybrid | Medium | Medium | High (external) | Medium |
 | GitOps-Only | High | Low | High | High |
@@ -430,9 +496,10 @@ The **Full CI/CD Automation approach (bd-3ul) is complete and recommended** for 
 
 ### Recommended Next Steps
 
-1. **For production:** Configure CI/CD secrets and enable the workflows
-2. **For testing:** Use the manual workaround script
-3. **For enhancement:** Consider hybrid approach if external secret management is needed
+1. **For production with full features:** Use Full CI/CD Automation - configure CI/CD secrets and enable the full workflows
+2. **For quick CI/CD setup with minimal complexity:** Use Simplified CI/CD - just add HUB_ADMIN_KEY secret
+3. **For testing/development:** Use the manual workaround script
+4. **For enhancement:** Consider hybrid approach if external secret management is needed
 
 ## References
 
@@ -440,12 +507,15 @@ The **Full CI/CD Automation approach (bd-3ul) is complete and recommended** for 
 - [Agent Registration Guide](./agent-registration-guide.md) - Full documentation
 - [Workaround Guide](./agent-registration-workaround.md) - Manual process
 - [Deployment Guide](./agent-registration-deployment-guide.md) - CI/CD setup
-- [GitHub Actions Workflow](../.github/workflows/agent-registration.yml) - Implementation
-- [Forgejo Actions Workflow](../.forgejo/workflows/agent-registration.yml) - Implementation
+- [GitHub Actions Workflow (Full)](../.github/workflows/agent-registration.yml) - Implementation
+- [GitHub Actions Workflow (Simplified)](../.github/workflows/agent-registration-simple.yml) - Minimal implementation
+- [Forgejo Actions Workflow (Full)](../.forgejo/workflows/agent-registration.yml) - Implementation
+- [Forgejo Actions Workflow (Simplified)](../.forgejo/workflows/agent-registration-simple.yml) - Minimal implementation
 - [Registration Script](../scripts/register_agents.py) - Core logic
 
 ---
 
-**Document Version:** 1.0
+**Document Version:** 1.1
 **Last Updated:** 2026-02-07
-**Author:** Research for bd-123 (Alternative: Research and document options)
+**Author:** Research for bd-bd9 (Alternative: Research and document options)
+**Note:** This research documents that bd-3ul (Full CI/CD Automation) is already implemented and ready for use.
