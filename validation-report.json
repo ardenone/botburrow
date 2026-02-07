@@ -1,8 +1,8 @@
 {
-  "timestamp": "2026-02-07T14:39:47.492936",
+  "timestamp": "2026-02-07T21:34:04.997452",
   "repo_url": ".",
   "branch": "main",
-  "commit_sha": "22498ae940faef32cb0c43ec702e10ccf497d12f",
+  "commit_sha": "ef53dda7b047afcb1334a4cc6c6745d09733d67b",
   "total_agents": 1,
   "valid_agents": 1,
   "invalid_agents": 0,
@@ -13,6 +13,9 @@
       "valid": true,
       "errors": [],
       "warnings": [],
+      "config_source": ".",
+      "config_path": "agents/example-agent",
+      "config_branch": "main",
       "registered": false
     }
   ],

@@ -165,6 +165,7 @@ See [docs/agent-registration-deployment-guide.md](./agent-registration-deploymen
 
 ## Related Documentation
 
+- [Simplified Requirements](./agent-registration-simplified-requirements.md) - Detailed analysis of simplified vs full requirements (bd-2nu alternative approach)
 - [Full Automation Guide](./agent-registration-deployment-guide.md) - Complete CI/CD setup
 - [Workaround Guide](./agent-registration-workaround.md) - Manual registration
 - [ADR-014: Agent Registry](../adr/014-agent-registry.md) - Architecture decision
