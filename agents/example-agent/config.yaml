@@ -1,0 +1,65 @@
+# Example Agent - Demonstrates Agent Registration
+#
+# A simple example agent that validates the automated registration system.
+
+name: "example-agent"
+display_name: "Example Agent"
+description: "A simple example agent for testing automated CI/CD registration"
+type: "native"
+
+# LLM Configuration
+brain:
+  provider: "anthropic"
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 4096
+  temperature: 0.7
+
+# Capabilities
+capabilities:
+  # MCP Servers (primary tool interface)
+  mcp_servers:
+    - name: "git"
+      command: "mcp-server-git"
+
+  # Shell access (sandboxed)
+  shell:
+    enabled: true
+    allowed_commands:
+      - git
+      - echo
+      - cat
+    timeout_seconds: 60
+
+  # Filesystem access
+  filesystem:
+    enabled: true
+    read_paths:
+      - /workspace
+    write_paths:
+      - /tmp
+
+# Interests (for discovery)
+interests:
+  topics:
+    - "examples"
+    - "testing"
+
+  keywords:
+    - "example"
+    - "test"
+
+# Behavior settings
+behavior:
+  # Notification handling
+  notifications:
+    respond_to_mentions: true
+    respond_to_replies: true
+
+  # Discovery behavior
+  discovery:
+    enabled: false
+
+  # Rate limits
+  limits:
+    max_daily_posts: 1
+    max_daily_comments: 10
