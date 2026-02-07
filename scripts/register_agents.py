@@ -140,6 +140,40 @@ class ValidationResult:
 
 
 @dataclass
+class RepoConfig:
+    """Configuration for a single git repository."""
+    name: str
+    url: str
+    branch: str = "main"
+    auth_type: str = "none"  # none, token, ssh
+    auth_secret: Optional[str] = None
+    clone_path: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RepoConfig":
+        """Create RepoConfig from dictionary."""
+        return cls(
+            name=data.get("name", "unknown"),
+            url=data["url"],
+            branch=data.get("branch", "main"),
+            auth_type=data.get("auth_type", "none"),
+            auth_secret=data.get("auth_secret"),
+            clone_path=data.get("clone_path"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert RepoConfig to dictionary."""
+        return {
+            "name": self.name,
+            "url": self.url,
+            "branch": self.branch,
+            "auth_type": self.auth_type,
+            "auth_secret": self.auth_secret,
+            "clone_path": self.clone_path,
+        }
+
+
+@dataclass
 class AgentConfig:
     """Agent configuration loaded from git repository."""
     name: str
@@ -157,7 +191,14 @@ class AgentConfig:
     system_prompt: Optional[str] = None
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any], system_prompt: Optional[str] = None) -> "AgentConfig":
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        system_prompt: Optional[str] = None,
+        config_source: Optional[str] = None,
+        config_path: Optional[str] = None,
+        config_branch: str = "main",
+    ) -> "AgentConfig":
         """Create AgentConfig from dictionary."""
         return cls(
             name=data.get("name", ""),
@@ -170,6 +211,9 @@ class AgentConfig:
             behavior=data.get("behavior", {}),
             memory=data.get("memory", {}),
             system_prompt=system_prompt,
+            config_source=config_source,
+            config_path=config_path,
+            config_branch=config_branch,
         )
 
 
@@ -182,11 +226,15 @@ class GitRepository:
         branch: str = "main",
         clone_depth: int = 1,
         timeout: int = 30,
+        auth_type: str = "none",
+        auth_secret: Optional[str] = None,
     ):
         self.url = url
         self.branch = branch
         self.clone_depth = clone_depth
         self.timeout = timeout
+        self.auth_type = auth_type
+        self.auth_secret = auth_secret
         self._temp_dir: Optional[tempfile.TemporaryDirectory] = None
         self.repo_path: Optional[Path] = None
 
@@ -212,7 +260,7 @@ class GitRepository:
             "--depth", str(self.clone_depth),
             "--single-branch",
             "--branch", self.branch,
-            self.url,
+            self._build_git_url(),
             str(self.repo_path),
         ]
 
@@ -222,6 +270,7 @@ class GitRepository:
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
+                env=self._get_auth_env(),
             )
             if result.returncode != 0:
                 raise RuntimeError(f"Git clone failed: {result.stderr}")
@@ -230,6 +279,79 @@ class GitRepository:
             raise RuntimeError(f"Git clone timeout after {self.timeout}s")
         except FileNotFoundError:
             raise RuntimeError("Git not found. Please install git.")
+
+    def _build_git_url(self) -> str:
+        """Build authenticated git URL if needed."""
+        if self.auth_type == "token" and self.auth_secret:
+            # For HTTPS with token, inject credentials into URL
+            if self.url.startswith("https://"):
+                token = self._read_secret(self.auth_secret)
+                if token:
+                    # Parse URL and inject token
+                    parts = self.url.replace("https://", "", 1).split("/", 1)
+                    if len(parts) == 2:
+                        return f"https://{token}@{parts[0]}/{parts[1]}"
+            return self.url
+        elif self.auth_type == "ssh":
+            # SSH URLs already contain auth via ssh key
+            return self.url
+        else:
+            return self.url
+
+    def _get_auth_env(self) -> Dict[str, str]:
+        """Get environment variables for authentication."""
+        env = os.environ.copy()
+
+        if self.auth_type == "ssh":
+            # Set GIT_SSH_COMMAND to use specific key if available
+            if self.auth_secret:
+                key_path = self._get_ssh_key_path()
+                if key_path:
+                    env["GIT_SSH_COMMAND"] = f"ssh -i {key_path} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
+                    env["GIT_TERMINAL_PROMPT"] = "0"
+
+        elif self.auth_type == "token" and self.auth_secret:
+            # Set credential helper environment
+            token = self._read_secret(self.auth_secret)
+            if token:
+                env["GIT_USERNAME"] = "token" if "github" in self.url else "oauth2"
+                env["GIT_PASSWORD"] = token
+                env["GIT_TERMINAL_PROMPT"] = "0"
+
+        return env
+
+    def _read_secret(self, secret_ref: str) -> Optional[str]:
+        """Read secret from file or environment variable."""
+        # Try Kubernetes secret mount path first
+        secret_path = Path(f"/etc/secrets/{secret_ref}/token")
+        if secret_path.exists():
+            return secret_path.read_text().strip()
+
+        # Try environment variable
+        env_name = secret_ref.upper().replace("-", "_")
+        return os.environ.get(env_name)
+
+    def _get_ssh_key_path(self) -> Optional[str]:
+        """Get SSH key path from secret reference."""
+        if not self.auth_secret:
+            return None
+
+        # Try Kubernetes secret mount path
+        key_path = Path(f"/etc/secrets/{self.auth_secret}/id_rsa")
+        if key_path.exists():
+            return str(key_path)
+
+        # Try common paths
+        for path in [
+            f"/etc/secrets/{self.auth_secret}/ssh",
+            f"/etc/secrets/{self.auth_secret}/identity",
+        ]:
+            if Path(path).exists():
+                return path
+
+        # Try environment variable pointing to key file
+        env_name = self.auth_secret.upper().replace("-", "_") + "_PATH"
+        return os.environ.get(env_name)
 
     def get_agents(self) -> List[Tuple[Path, Dict[str, Any], Optional[str]]]:
         """Find all agent configurations in the repository."""
@@ -620,10 +742,55 @@ data:
     return secret_yaml
 
 
-def load_repos_config(path: str) -> List[Dict[str, Any]]:
-    """Load repository configuration from JSON file."""
+def load_repos_config(path: str) -> List[RepoConfig]:
+    """Load repository configuration from JSON file.
+
+    The file should contain a list of repository configurations:
+
+    [
+      {
+        "name": "internal-agents",
+        "url": "https://forgejo.example.com/org/agent-definitions.git",
+        "branch": "main",
+        "auth_type": "none",
+        "clone_path": "/configs/internal"
+      },
+      {
+        "name": "public-agents",
+        "url": "https://github.com/org/public-agents.git",
+        "branch": "main",
+        "auth_type": "token",
+        "auth_secret": "github-token"
+      },
+      {
+        "name": "team-agents",
+        "url": "git@gitlab.com:myteam/specialized-agents.git",
+        "branch": "main",
+        "auth_type": "ssh",
+        "auth_secret": "gitlab-ssh-key"
+      }
+    ]
+    """
     with open(path) as f:
-        return json.load(f)
+        data = json.load(f)
+
+    # Support both simple URL strings and full config objects
+    repos = []
+    for item in data:
+        if isinstance(item, str):
+            # Simple URL string - use defaults
+            repos.append(RepoConfig(
+                name="unknown",
+                url=item,
+                branch="main",
+                auth_type="none",
+            ))
+        elif isinstance(item, dict):
+            repos.append(RepoConfig.from_dict(item))
+        else:
+            logger.warning(f"Skipping invalid repo config: {item}")
+
+    return repos
 
 
 def get_git_info() -> Tuple[str, str]:
@@ -726,12 +893,22 @@ Examples:
     parser.add_argument(
         "--repos-file",
         type=Path,
-        help="JSON file with repository configurations",
+        help="JSON file with repository configurations (supports auth_type, auth_secret, branch)",
     )
     parser.add_argument(
         "--branch",
         default="main",
-        help="Git branch to use (default: main)",
+        help="Git branch to use (default: main, overridden by repos-file config)",
+    )
+    parser.add_argument(
+        "--auth-type",
+        default="none",
+        choices=["none", "token", "ssh"],
+        help="Authentication type for --repo URLs (default: none)",
+    )
+    parser.add_argument(
+        "--auth-secret",
+        help="Secret reference for token or SSH auth (e.g., secret-name for /etc/secrets/secret-name/token)",
     )
     parser.add_argument(
         "--hub-url",
@@ -826,18 +1003,31 @@ Examples:
             )
 
     # Load repository configurations
-    repos = []
+    repo_configs: List[RepoConfig] = []
     if args.repos_file:
         try:
-            repos_config = load_repos_config(args.repos_file)
-            repos = [r["url"] for r in repos_config]
+            repo_configs = load_repos_config(args.repos_file)
         except Exception as e:
             logger.error(f"Failed to load repos file: {e}")
             return 1
+    elif args.repos:
+        # Convert --repo arguments to RepoConfig objects
+        for i, url in enumerate(args.repos):
+            repo_configs.append(RepoConfig(
+                name=f"repo-{i}",
+                url=url,
+                branch=args.branch,
+                auth_type=args.auth_type,
+                auth_secret=args.auth_secret,
+            ))
     else:
-        repos = args.repos
+        parser.error("Either --repo or --repos-file must be specified")
 
-    logger.info(f"Found {len(repos)} repository(s) to process")
+    logger.info(f"Found {len(repo_configs)} repository(s) to process")
+
+    # Log each repository with its auth type
+    for repo in repo_configs:
+        logger.info(f"  - {repo.url} (branch: {repo.branch}, auth: {repo.auth_type})")
 
     # Create validator
     validator = ConfigValidator(strict=args.strict)
@@ -866,15 +1056,17 @@ Examples:
     # Track agent validation data for reports
     agents_validation_data: List[Dict[str, Any]] = []
 
-    for repo_url in repos:
-        logger.info(f"Processing repository: {repo_url}")
+    for repo_config in repo_configs:
+        logger.info(f"Processing repository: {repo_config.url}")
 
         try:
             with GitRepository(
-                url=repo_url,
-                branch=args.branch,
+                url=repo_config.url,
+                branch=repo_config.branch,
                 clone_depth=args.git_depth,
                 timeout=args.git_timeout,
+                auth_type=repo_config.auth_type,
+                auth_secret=repo_config.auth_secret,
             ) as repo:
                 agents = repo.get_agents()
                 logger.info(f"Found {len(agents)} agent(s) in repository")
@@ -883,11 +1075,14 @@ Examples:
                     agent_name = agent_dir.name
                     total_agents += 1
 
-                    # Create AgentConfig
-                    config = AgentConfig.from_dict(config_dict, system_prompt)
-                    config.config_source = repo_url
-                    config.config_branch = args.branch
-                    config.config_path = f"agents/{agent_name}"
+                    # Create AgentConfig with config_source tracking
+                    config = AgentConfig.from_dict(
+                        config_dict,
+                        system_prompt,
+                        config_source=repo_config.url,
+                        config_path=f"agents/{agent_name}",
+                        config_branch=repo_config.branch,
+                    )
 
                     # Validate configuration
                     validation = validator.validate_agent(agent_name, config_dict, system_prompt)
@@ -898,6 +1093,9 @@ Examples:
                         "valid": validation.is_valid,
                         "errors": validation.errors,
                         "warnings": validation.warnings,
+                        "config_source": repo_config.url,
+                        "config_path": f"agents/{agent_name}",
+                        "config_branch": repo_config.branch,
                     }
                     agents_validation_data.append(agent_data)
 
@@ -920,7 +1118,7 @@ Examples:
                         try:
                             result = registrar.register_agent(
                                 config,
-                                config_source=repo_url,
+                                config_source=repo_config.url,
                                 config_path=config.config_path,
                             )
                             succeeded += 1
@@ -965,7 +1163,7 @@ Examples:
                         agent_data["registered"] = False  # Not registered due to validate-only
 
         except Exception as e:
-            logger.error(f"Failed to process repository {repo_url}: {e}")
+            logger.error(f"Failed to process repository {repo_config.url}: {e}")
             continue
 
     # Generate validation reports
@@ -978,13 +1176,14 @@ Examples:
             commit_sha = args.commit_sha
 
         # Use first repo for report (or current repo if validating local)
-        report_repo = repos[0] if repos else "local"
+        report_repo = repo_configs[0].url if repo_configs else "local"
+        report_branch = repo_configs[0].branch if repo_configs else args.branch
 
         # Generate validation report
         report = generate_validation_report(
             agents_validation_data,
             repo_url=report_repo,
-            branch=args.branch,
+            branch=report_branch,
             commit_sha=commit_sha,
         )
 
@@ -1017,24 +1216,30 @@ Examples:
         if args.verbose or args.dry_run:
             print("\n" + report.to_markdown())
 
-        # Output JSON results for webhook integration
+        # Output JSON results for webhook integration with multi-repo support
         webhook_results = []
         for agent_data in agents_validation_data:
             if agent_data.get("registered") and "full_api_key" in agent_data:
                 webhook_results.append({
                     "name": agent_data["name"],
                     "api_key": agent_data["full_api_key"],
-                    "config_source": agent_data.get("config_source", repos[0] if repos else "unknown"),
-                    "config_path": f"agents/{agent_data['name']}",
-                    "config_branch": args.branch,
+                    "config_source": agent_data.get("config_source", "unknown"),
+                    "config_path": agent_data.get("config_path", f"agents/{agent_data['name']}"),
+                    "config_branch": agent_data.get("config_branch", "main"),
                 })
 
         if webhook_results:
             webhook_file = Path("registration-results.json")
             with open(webhook_file, "w") as f:
                 json.dump({
-                    "repository": repos[0] if repos else "local",
-                    "branch": args.branch,
+                    "repositories": [
+                        {
+                            "url": rc.url,
+                            "branch": rc.branch,
+                            "auth_type": rc.auth_type,
+                        }
+                        for rc in repo_configs
+                    ],
                     "commit_sha": commit_sha,
                     "timestamp": datetime.now().isoformat(),
                     "agents": webhook_results,

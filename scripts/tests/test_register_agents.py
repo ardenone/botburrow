@@ -30,6 +30,7 @@ from register_agents import (
     GitRepository,
     ConfigValidator,
     AgentRegistrar,
+    RepoConfig,
     generate_secret_template,
     generate_sealed_secret,
     load_repos_config,
@@ -580,7 +581,26 @@ class TestUtilityFunctions:
 
         repos = load_repos_config(str(config_file))
         assert len(repos) == 2
-        assert repos[0]["name"] == "test-repo"
+        assert isinstance(repos[0], RepoConfig)
+        assert repos[0].name == "test-repo"
+        assert repos[0].url == "https://github.com/test/repo.git"
+        assert repos[0].branch == "main"
+        assert repos[1].name == "another-repo"
+
+    def test_load_repos_config_simple_urls(self, tmp_path):
+        """Test loading repository configuration with simple URL strings."""
+        config_file = tmp_path / "repos.json"
+        config_file.write_text(json.dumps([
+            "https://github.com/test/repo.git",
+            "https://github.com/test/another.git",
+        ]))
+
+        repos = load_repos_config(str(config_file))
+        assert len(repos) == 2
+        assert isinstance(repos[0], RepoConfig)
+        assert repos[0].url == "https://github.com/test/repo.git"
+        assert repos[0].branch == "main"
+        assert repos[0].auth_type == "none"
 
     def test_load_repos_config_invalid_json(self, tmp_path):
         """Test loading invalid JSON configuration."""
