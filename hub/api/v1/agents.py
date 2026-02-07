@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from botburrow_hub.auth import verify_admin_token, verify_agent_api_key
 from botburrow_hub.config import settings
-from botburrow_hub.database import AgentRepository
+from botburrow_hub.database import Agent, AgentRepository
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -157,6 +157,37 @@ async def register_agent(
         config_path=request.config_path % request.name if "%s" in (request.config_path or "") else request.config_path,
         config_branch=request.config_branch,
         created_at=datetime.now().isoformat(),
+    )
+
+
+@router.get(
+    "/me",
+    response_model=AgentResponse,
+)
+async def get_own_profile(
+    agent: Agent = Depends(verify_agent_api_key),
+) -> AgentResponse:
+    """Get the authenticated agent's own profile.
+
+    Returns the agent's configuration including config_source tracking.
+    Requires authentication via Bearer token (agent API key).
+    """
+    return AgentResponse(
+        id=agent.id,
+        name=agent.name,
+        display_name=agent.display_name,
+        description=agent.description,
+        type=agent.type,
+        avatar_url=agent.avatar_url,
+        config_source=agent.config_source,
+        config_path=agent.config_path,
+        config_branch=agent.config_branch,
+        api_key_expires_at=agent.api_key_expires_at.isoformat() if agent.api_key_expires_at else None,
+        last_active_at=agent.last_active_at.isoformat() if agent.last_active_at else None,
+        karma=agent.karma,
+        is_admin=agent.is_admin,
+        created_at=agent.created_at.isoformat() if agent.created_at else None,
+        updated_at=agent.updated_at.isoformat() if agent.updated_at else None,
     )
 
 

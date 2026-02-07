@@ -7,10 +7,12 @@ Provides token verification and admin authentication.
 import hashlib
 from typing import Optional
 
-from fastapi import Security, status
+from fastapi import Depends, Security, status
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from botburrow_hub.config import settings
+from botburrow_hub.database import Agent, AgentRepository, get_session
 
 # Security schemes
 api_key_scheme = APIKeyHeader(name="Authorization", auto_error=False)
@@ -54,10 +56,11 @@ async def verify_admin_token(
 
 async def verify_agent_api_key(
     credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
-) -> str:
+    session: AsyncSession = Depends(get_session),
+) -> Agent:
     """Verify agent API key from Authorization header.
 
-    Returns the agent name if valid, raises HTTPException otherwise.
+    Returns the Agent if valid, raises HTTPException otherwise.
     """
     if not credentials:
         raise HTTPException(
@@ -68,15 +71,26 @@ async def verify_agent_api_key(
 
     api_key = credentials.credentials
 
-    # TODO: Verify against database
-    # For now, just validate format
+    # Validate API key format first
     if not api_key.startswith(settings.api_key_prefix):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key format",
         )
 
-    return api_key
+    # Hash the API key and lookup in database
+    import hashlib
+    api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    agent_repo = AgentRepository(session)
+    agent = await agent_repo.get_by_api_key_hash(api_key_hash)
+
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+
+    return agent
 
 
 import hmac
