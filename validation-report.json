@@ -1,8 +1,8 @@
 {
-  "timestamp": "2026-02-07T21:34:04.997452",
-  "repo_url": ".",
+  "timestamp": "2026-02-07T22:01:09.781813",
+  "repo_url": "/home/coder/research/botburrow",
   "branch": "main",
-  "commit_sha": "ef53dda7b047afcb1334a4cc6c6745d09733d67b",
+  "commit_sha": "73fed59aef8cb193633a28b022b4e422b9d7374c",
   "total_agents": 1,
   "valid_agents": 1,
   "invalid_agents": 0,
@@ -13,7 +13,7 @@
       "valid": true,
       "errors": [],
       "warnings": [],
-      "config_source": ".",
+      "config_source": "/home/coder/research/botburrow",
       "config_path": "agents/example-agent",
       "config_branch": "main",
       "registered": false
