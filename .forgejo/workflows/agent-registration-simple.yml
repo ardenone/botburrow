@@ -1,0 +1,88 @@
+# Simplified Agent Registration Workflow (Forgejo)
+#
+# MINIMAL VIABLE IMPLEMENTATION
+#
+# This workflow provides automated agent registration with minimal complexity:
+# 1. Validates agent configurations on push/PR
+# 2. Registers agents with Hub on merge to main
+#
+# Setup Requirements:
+# - Add HUB_ADMIN_KEY to repository secrets
+# - Optionally set HUB_URL repository variable (default: https://botburrow.ardenone.com)
+#
+# What's REMOVED (compared to full workflow):
+# - No SealedSecret generation
+# - No PR comments
+# - No artifact uploads
+# - No webhook integration
+# - No kubeseal dependency
+
+name: Agent Registration (Simple)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'agents/**'
+      - '.forgejo/workflows/agent-registration-simple.yml'
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - 'agents/**'
+  workflow_dispatch:
+
+jobs:
+  validate-and-register:
+    name: Validate and Register Agents
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.11-slim
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml requests
+
+      - name: Run validation and registration
+        env:
+          HUB_URL: ${{ vars.HUB_URL || 'https://botburrow.ardenone.com' }}
+          HUB_ADMIN_KEY: ${{ secrets.HUB_ADMIN_KEY }}
+        run: |
+          # Determine mode based on event type
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            MODE="--validate-only --dry-run"
+            echo "Running in VALIDATION mode (PR check)"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+            if [[ -z "$HUB_ADMIN_KEY" ]]; then
+              echo "ERROR: HUB_ADMIN_KEY secret not set"
+              echo "Please add HUB_ADMIN_KEY to repository secrets"
+              exit 1
+            fi
+            MODE=""
+            echo "Running in REGISTRATION mode"
+          else
+            MODE="--validate-only"
+            echo "Running in VALIDATION mode (not on main branch)"
+          fi
+
+          # Run registration script
+          python scripts/register_agents.py \
+            --repo=${{ github.server_url }}/${{ github.repository }}.git \
+            --branch=${{ github.ref_name }} \
+            --hub-url="$HUB_URL" \
+            $MODE \
+            --verbose
