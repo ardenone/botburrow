@@ -28,7 +28,8 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -47,6 +48,77 @@ class ValidationSeverity(Enum):
     """Validation error severity levels."""
     ERROR = "error"
     WARNING = "warning"
+
+
+@dataclass
+class AgentValidationReport:
+    """Comprehensive validation report for CI/CD."""
+    timestamp: str
+    repo_url: str
+    branch: str
+    commit_sha: str
+    total_agents: int
+    valid_agents: int
+    invalid_agents: int
+    warnings: int
+    agents: List[Dict[str, Any]]
+    summary: str
+
+    def to_json(self, indent: int = 2) -> str:
+        """Convert report to JSON string."""
+        return json.dumps(asdict(self), indent=indent)
+
+    def to_markdown(self) -> str:
+        """Convert report to Markdown for PR comments."""
+        lines = [
+            "## Agent Registration Validation Report",
+            "",
+            f"**Repository:** `{self.repo_url}`",
+            f"**Branch:** `{self.branch}`",
+            f"**Commit:** `{self.commit_sha}`",
+            f"**Timestamp:** {self.timestamp}",
+            "",
+            "### Summary",
+            "",
+            f"| Metric | Count |",
+            f"|--------|-------|",
+            f"| Total Agents | {self.total_agents} |",
+            f"| Valid | {self.valid_agents} |",
+            f"| Invalid | {self.invalid_agents} |",
+            f"| Warnings | {self.warnings} |",
+            "",
+        ]
+
+        if self.invalid_agents > 0:
+            lines.extend([
+                "### ❌ Validation Errors",
+                "",
+            ])
+            for agent in self.agents:
+                if agent.get("errors"):
+                    lines.append(f"#### `{agent['name']}`")
+                    for error in agent["errors"]:
+                        lines.append(f"- {error}")
+                    lines.append("")
+
+        if self.warnings > 0:
+            lines.extend([
+                "### ⚠️ Warnings",
+                "",
+            ])
+            for agent in self.agents:
+                if agent.get("warnings"):
+                    lines.append(f"#### `{agent['name']}`")
+                    for warning in agent["warnings"]:
+                        lines.append(f"- {warning}")
+                    lines.append("")
+
+        lines.extend([
+            "---",
+            self.summary,
+        ])
+
+        return "\n".join(lines)
 
 
 @dataclass
@@ -553,6 +625,66 @@ def load_repos_config(path: str) -> List[Dict[str, Any]]:
         return json.load(f)
 
 
+def get_git_info() -> Tuple[str, str]:
+    """Get current git commit SHA and branch."""
+    try:
+        # Get commit SHA
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        commit_sha = result.stdout.strip() if result.returncode == 0 else "unknown"
+
+        # Get branch name
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        branch = result.stdout.strip() if result.returncode == 0 else "unknown"
+
+        return commit_sha, branch
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return "unknown", "unknown"
+
+
+def generate_validation_report(
+    agents_data: List[Dict[str, Any]],
+    repo_url: str,
+    branch: str,
+    commit_sha: str,
+) -> AgentValidationReport:
+    """Generate a validation report from processed agents data."""
+    total = len(agents_data)
+    valid = sum(1 for a in agents_data if a.get("valid", False))
+    invalid = total - valid
+    warnings = sum(len(a.get("warnings", [])) for a in agents_data)
+
+    # Generate summary
+    if invalid == 0:
+        summary = f"✅ All {total} agent(s) validated successfully."
+    elif valid == 0:
+        summary = f"❌ All {total} agent(s) failed validation."
+    else:
+        summary = f"⚠️ {valid}/{total} agent(s) valid, {invalid} failed."
+
+    return AgentValidationReport(
+        timestamp=datetime.now().isoformat(),
+        repo_url=repo_url,
+        branch=branch,
+        commit_sha=commit_sha,
+        total_agents=total,
+        valid_agents=valid,
+        invalid_agents=invalid,
+        warnings=warnings,
+        agents=agents_data,
+        summary=summary,
+    )
+
+
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -652,8 +784,27 @@ Examples:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--output-report",
+        type=Path,
+        help="Output path for validation report JSON (default: validation-report.json)",
+    )
+    parser.add_argument(
+        "--output-markdown",
+        type=Path,
+        help="Output path for validation report Markdown",
+    )
+    parser.add_argument(
+        "--commit-sha",
+        default=os.environ.get("GITHUB_SHA", os.environ.get("CI_COMMIT_SHA", "")),
+        help="Git commit SHA for report (auto-detected in CI)",
+    )
 
     args = parser.parse_args()
+
+    # Default report output
+    if args.output_report is None:
+        args.output_report = Path("validation-report.json")
 
     # Configure logging level
     if args.verbose:
@@ -711,6 +862,9 @@ Examples:
     failed = 0
     validation_errors = 0
 
+    # Track agent validation data for reports
+    agents_validation_data: List[Dict[str, Any]] = []
+
     for repo_url in repos:
         logger.info(f"Processing repository: {repo_url}")
 
@@ -737,6 +891,15 @@ Examples:
                     # Validate configuration
                     validation = validator.validate_agent(agent_name, config_dict, system_prompt)
 
+                    # Track validation data
+                    agent_data = {
+                        "name": agent_name,
+                        "valid": validation.is_valid,
+                        "errors": validation.errors,
+                        "warnings": validation.warnings,
+                    }
+                    agents_validation_data.append(agent_data)
+
                     if not validation.is_valid:
                         logger.error(f"Agent '{agent_name}' has validation errors:")
                         for error in validation.errors:
@@ -761,6 +924,12 @@ Examples:
                             )
                             succeeded += 1
 
+                            # Store API key in validation data (masked)
+                            if "api_key" in result:
+                                api_key = result["api_key"]
+                                agent_data["api_key"] = api_key[:20] + "..." if len(api_key) > 20 else "***"
+                                agent_data["registered"] = True
+
                             # Generate secret manifest if requested
                             if args.output_secrets:
                                 api_key = result.get("api_key", "")
@@ -784,23 +953,73 @@ Examples:
 
                         except Exception as e:
                             logger.error(f"Failed to register agent '{agent_name}': {e}")
+                            agent_data["registered"] = False
+                            agent_data["registration_error"] = str(e)
                             failed += 1
                     else:
                         succeeded += 1
+                        agent_data["registered"] = False  # Not registered due to validate-only
 
         except Exception as e:
             logger.error(f"Failed to process repository {repo_url}: {e}")
             continue
 
-    # Print summary
-    logger.info("=" * 60)
-    logger.info("Registration Summary:")
-    logger.info(f"  Total agents found: {total_agents}")
-    logger.info(f"  Succeeded: {succeeded}")
-    logger.info(f"  Failed: {failed}")
-    if validation_errors > 0:
-        logger.info(f"  Validation errors: {validation_errors}")
-    logger.info("=" * 60)
+    # Generate validation reports
+    if agents_validation_data:
+        # Get git info for report
+        commit_sha, git_branch = get_git_info()
+
+        # Use provided commit SHA if available (CI environment)
+        if args.commit_sha:
+            commit_sha = args.commit_sha
+
+        # Use first repo for report (or current repo if validating local)
+        report_repo = repos[0] if repos else "local"
+
+        # Generate validation report
+        report = generate_validation_report(
+            agents_validation_data,
+            repo_url=report_repo,
+            branch=args.branch,
+            commit_sha=commit_sha,
+        )
+
+        # Write JSON report
+        if args.output_report:
+            args.output_report.parent.mkdir(parents=True, exist_ok=True)
+            with open(args.output_report, "w") as f:
+                f.write(report.to_json())
+            logger.info(f"Validation report written to: {args.output_report}")
+
+        # Write Markdown report if requested
+        if args.output_markdown:
+            args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
+            with open(args.output_markdown, "w") as f:
+                f.write(report.to_markdown())
+            logger.info(f"Markdown report written to: {args.output_markdown}")
+
+        # Print report summary to console
+        logger.info("=" * 60)
+        logger.info("Registration Summary:")
+        logger.info(f"  Total agents found: {total_agents}")
+        logger.info(f"  Succeeded: {succeeded}")
+        logger.info(f"  Failed: {failed}")
+        if validation_errors > 0:
+            logger.info(f"  Validation errors: {validation_errors}")
+        logger.info(f"  Report: {report.summary}")
+        logger.info("=" * 60)
+
+        # Print markdown to stdout for CI consumption
+        if args.verbose or args.dry_run:
+            print("\n" + report.to_markdown())
+    else:
+        # No agents found, print basic summary
+        logger.info("=" * 60)
+        logger.info("Registration Summary:")
+        logger.info(f"  Total agents found: {total_agents}")
+        logger.info(f"  Succeeded: {succeeded}")
+        logger.info(f"  Failed: {failed}")
+        logger.info("=" * 60)
 
     # Return exit code
     if failed > 0 or (args.strict and validation_errors > 0):

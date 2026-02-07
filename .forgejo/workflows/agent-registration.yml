@@ -59,7 +59,10 @@ jobs:
             --validate-only \
             --strict \
             --repo=${{ github.server_url }}/${{ github.repository }}.git \
-            --branch=${{ github.ref_name }}
+            --branch=${{ github.ref_name }} \
+            --output-report=validation-report.json \
+            --output-markdown=validation-report.md \
+            --commit-sha=${{ github.sha }}
 
       - name: Upload validation results
         if: always()
@@ -68,6 +71,7 @@ jobs:
           name: validation-results
           path: |
             validation-report.json
+            validation-report.md
           retention-days: 7
 
   register:
