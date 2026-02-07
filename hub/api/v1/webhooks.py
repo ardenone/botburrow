@@ -1,16 +1,20 @@
 """
-Webhook endpoints for CI/CD integration.
+Webhook endpoints for CI/CD integration and config cache invalidation.
 
-Allows CI/CD workflows to deliver agent registration results (including API keys)
-securely to the cluster for automatic SealedSecret creation.
+Allows CI/CD workflows to:
+- Deliver agent registration results (including API keys) for SealedSecret creation
+- Invalidate agent config caches when configs change in git
+- Trigger git pulls to refresh agent definitions
 """
 
+import asyncio
 import hashlib
 import hmac
 import logging
 import os
+import subprocess
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request, Security, status
@@ -18,6 +22,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 
 from botburrow_hub.auth import verify_admin_token
+from botburrow_hub.cache import get_cache
 from botburrow_hub.config import settings
 
 logger = logging.getLogger(__name__)
@@ -458,3 +463,275 @@ async def webhook_ping(
         "service": "botburrow-hub-webhooks",
         "timestamp": datetime.now().isoformat(),
     }
+
+
+# ============================================================================
+# Config Cache Invalidation Webhook
+# ============================================================================
+
+class ConfigChangeWebhook(BaseModel):
+    """Webhook payload for agent config changes.
+
+    This webhook is triggered when agent configs change in git,
+    signaling runners to invalidate their cache and pull latest configs.
+    """
+
+    repository: str = Field(..., description="Git repository URL")
+    branch: str = Field(default="main", description="Git branch")
+    commit_sha: str = Field(..., description="Git commit SHA that triggered change")
+    commit_message: Optional[str] = Field(None, description="Commit message")
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+    changed_files: List[str] = Field(
+        default_factory=list,
+        description="List of changed file paths (for filtering specific agents)"
+    )
+    agent_names: Optional[List[str]] = Field(
+        None,
+        description="Specific agent names that changed (if known)"
+    )
+    trigger_git_pull: bool = Field(
+        default=True,
+        description="Whether runners should execute git pull after invalidation"
+    )
+
+
+class CacheInvalidationResponse(BaseModel):
+    """Response to cache invalidation webhook."""
+
+    success: bool
+    message: str
+    timestamp: str
+    repository: str
+    commit_sha: str
+    invalidated_agents: List[str]
+    cache_type: str
+    git_pull_triggered: bool
+
+
+def _extract_agent_names_from_paths(changed_files: List[str]) -> List[str]:
+    """Extract agent names from changed file paths.
+
+    Args:
+        changed_files: List of file paths like 'agents/claude-coder-1/config.yaml'
+
+    Returns:
+        List of unique agent names that were affected
+    """
+    agent_names = set()
+
+    for path in changed_files:
+        # Extract agent name from patterns like:
+        # - agents/agent-name/config.yaml
+        # - agents/agent-name/system-prompt.md
+        # - agent-name/config.yaml
+        parts = path.split("/")
+        for i, part in enumerate(parts):
+            if part == "agents" and i + 1 < len(parts):
+                agent_name = parts[i + 1]
+                if agent_name and agent_name not in (".", ".."):
+                    agent_names.add(agent_name)
+
+    return sorted(agent_names)
+
+
+async def _trigger_git_pull(
+    config_source: str,
+    branch: str,
+    clone_paths: Optional[List[str]] = None,
+) -> Dict[str, bool]:
+    """Trigger git pull on configured repository paths.
+
+    This is called when config changes require runners to update their
+    local clone of the agent definitions repository.
+
+    Args:
+        config_source: Git repository URL
+        branch: Git branch to pull
+        clone_paths: Optional list of paths to update (if None, uses default)
+
+    Returns:
+        Dictionary mapping paths to success status
+    """
+    results = {}
+
+    # Default clone paths based on config source
+    if clone_paths is None:
+        # Derive from config_source URL
+        import re
+        repo_name = re.sub(r'\.git$', '', config_source.split("/")[-1])
+        clone_paths = [f"/configs/{repo_name}"]
+
+    for path in clone_paths:
+        try:
+            # Check if path exists
+            if not os.path.exists(path):
+                logger.warning(f"Clone path does not exist: {path}")
+                results[path] = False
+                continue
+
+            # Execute git pull
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", path, "pull", "origin", branch,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode == 0:
+                logger.info(f"Git pull successful for {path}")
+                results[path] = True
+            else:
+                logger.warning(f"Git pull failed for {path}: {stderr.decode()}")
+                results[path] = False
+
+        except Exception as e:
+            logger.error(f"Error executing git pull for {path}: {e}")
+            results[path] = False
+
+    return results
+
+
+@router.post(
+    "/config-invalidation",
+    response_model=CacheInvalidationResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def config_cache_invalidation(
+    webhook_data: ConfigChangeWebhook,
+    request: Request,
+    _admin: str = Security(verify_admin_token),
+) -> CacheInvalidationResponse:
+    """Handle config cache invalidation webhook.
+
+    This endpoint is called by git webhooks (Forgejo, GitHub) when agent
+    configurations change. It:
+
+    1. Invalidates the distributed cache for affected agents
+    2. Publishes invalidation events to all runners via Redis pub/sub
+    3. Optionally triggers git pull to update local repository clones
+
+    This ensures all runners see the latest agent configurations without
+    waiting for cache TTL to expire.
+
+    Authentication: Requires admin API key (Bearer token)
+    """
+    logger.info(
+        f"Received config invalidation webhook for {webhook_data.repository} "
+        f"(commit: {webhook_data.commit_sha[:8]}, "
+        f"files: {len(webhook_data.changed_files)})"
+    )
+
+    cache = await get_cache()
+
+    # Determine which agents are affected
+    agent_names: List[str] = []
+
+    if webhook_data.agent_names:
+        # Webhook specified exact agent names
+        agent_names = webhook_data.agent_names
+    elif webhook_data.changed_files:
+        # Extract agent names from changed file paths
+        agent_names = _extract_agent_names_from_paths(webhook_data.changed_files)
+
+    # Invalidate cache for each affected agent
+    for agent_name in agent_names:
+        cache_key = f"agent:{agent_name}:{webhook_data.repository}"
+        await cache.delete(cache_key)
+
+    # Publish invalidation event to all runners
+    if agent_names:
+        for agent_name in agent_names:
+            await cache.publish_invalidation(
+                agent_name=agent_name,
+                config_source=webhook_data.repository,
+            )
+    else:
+        # No specific agents, invalidate all for this repo
+        await cache.publish_invalidation(
+            agent_name=None,
+            config_source=webhook_data.repository,
+        )
+
+    # Trigger git pull if requested
+    git_pull_triggered = False
+    if webhook_data.trigger_git_pull:
+        pull_results = await _trigger_git_pull(
+            config_source=webhook_data.repository,
+            branch=webhook_data.branch,
+        )
+        git_pull_triggered = any(pull_results.values())
+
+    # Get cache stats
+    cache_stats = await cache.get_stats()
+
+    return CacheInvalidationResponse(
+        success=True,
+        message=f"Invalidated {len(agent_names)} agent(s)",
+        timestamp=datetime.now().isoformat(),
+        repository=webhook_data.repository,
+        commit_sha=webhook_data.commit_sha,
+        invalidated_agents=agent_names,
+        cache_type=cache_stats.get("type", "memory"),
+        git_pull_triggered=git_pull_triggered,
+    )
+
+
+@router.post(
+    "/config-invalidation/all",
+    response_model=CacheInvalidationResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def invalidate_all_configs(
+    request: Request,
+    _admin: str = Security(verify_admin_token),
+) -> CacheInvalidationResponse:
+    """Invalidate all cached agent configurations.
+
+    This is a manual trigger to force all runners to reload their configs.
+    Use this when you need immediate refresh across all agents and repositories.
+
+    Authentication: Requires admin API key (Bearer token)
+    """
+    logger.warning("Manual invalidation of ALL agent configs requested")
+
+    cache = await get_cache()
+
+    # Invalidate all cache entries
+    count = await cache.invalidate_all()
+
+    # Publish global invalidation
+    await cache.publish_invalidation(agent_name=None, config_source=None)
+
+    # Get cache stats
+    cache_stats = await cache.get_stats()
+
+    return CacheInvalidationResponse(
+        success=True,
+        message=f"Invalidated all {count} cached entries",
+        timestamp=datetime.now().isoformat(),
+        repository="*",
+        commit_sha="manual",
+        invalidated_agents=["*"],
+        cache_type=cache_stats.get("type", "memory"),
+        git_pull_triggered=False,
+    )
+
+
+@router.get(
+    "/config-invalidation/stats",
+    response_model=Dict[str, Any],
+)
+async def get_cache_stats(
+    _admin: str = Security(verify_admin_token),
+) -> Dict[str, Any]:
+    """Get cache statistics for monitoring.
+
+    Returns information about cache type, size, and hit rates.
+
+    Authentication: Requires admin API key (Bearer token)
+    """
+    cache = await get_cache()
+    stats = await cache.get_stats()
+    stats["timestamp"] = datetime.now().isoformat()
+    return stats

@@ -92,6 +92,20 @@ class Settings(BaseSettings):
         description="Enable agent registration endpoint",
     )
 
+    # Cache Configuration
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis/Valkey connection URL for distributed cache",
+    )
+    cache_ttl: int = Field(
+        default=300,
+        description="Default cache TTL in seconds (5 minutes)",
+    )
+    cache_enabled: bool = Field(
+        default=True,
+        description="Enable distributed caching",
+    )
+
     # Logging
     log_level: str = Field(
         default="INFO",
