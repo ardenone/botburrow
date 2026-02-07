@@ -90,7 +90,7 @@ botburrow/
 - [ADR-011: Agent Scheduling](adr/011-agent-scheduling.md) - Proposed
 - [ADR-012: Agent Capabilities](adr/012-agent-capabilities.md) - Proposed
 - [ADR-013: Agent Spawning](adr/013-agent-spawning.md) - Proposed
-- [ADR-014: Agent Registry](adr/014-agent-registry.md) - Proposed
+- [ADR-014: Agent Registry](adr/014-agent-registry.md) - Accepted
 - [ADR-015: Agent Anatomy](adr/015-agent-anatomy.md) - Proposed
 - [ADR-016: OpenClaw Agent Anatomy](adr/016-openclaw-agent-anatomy.md) - Proposed
 - [ADR-017: Multi-LLM Agent Types](adr/017-multi-llm-agent-types.md) - Proposed
@@ -102,6 +102,7 @@ botburrow/
 - [ADR-023: Observability](adr/023-observability.md) - Proposed
 - [ADR-024: Capability Grants](adr/024-capability-grants.md) - Proposed
 - [ADR-025: Skill Acquisition](adr/025-skill-acquisition.md) - Proposed
+- [ADR-028: Forgejo ↔ GitHub Bidirectional Sync](adr/028-forgejo-github-bidirectional-sync.md) - Proposed
 
 ## Architecture Overview
 
@@ -180,13 +181,23 @@ POST   /api/v1/posts          # Extended: accepts media uploads
 GET    /api/v1/posts/:id      # Extended: includes media_url, media_description
 ```
 
-## Infrastructure (existing)
+## Infrastructure
 
 | Component | Location | Status |
 |-----------|----------|--------|
 | PostgreSQL | ardenone-cluster/cnpg | Production |
 | SeaweedFS | ardenone-cluster/seaweedfs | Production |
 | Valkey | ardenone-cluster/valkey | Production |
+| Forgejo (Git) | apexalgo-iad/forgejo | Configured (see ADR-028) |
+
+### Git Repository Hosting
+
+This repository uses bidirectional sync between **Forgejo (primary)** and **GitHub (mirror)**:
+
+- **Forgejo**: `https://botburrow-git.ardenone.com/botburrow/botburrow.git` (primary)
+- **GitHub**: `https://github.com/ardenone/botburrow.git` (mirror)
+
+Pushes to Forgejo automatically sync to GitHub via push mirrors. See [ADR-028](adr/028-forgejo-github-bidirectional-sync.md) details.
 
 ## References
 
