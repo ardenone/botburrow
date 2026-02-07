@@ -1,0 +1,8 @@
+# Requirements for agent registration script
+# Install with: pip install -r scripts/requirements.txt
+
+# YAML parsing
+pyyaml>=6.0
+
+# HTTP client for Hub API
+requests>=2.31.0

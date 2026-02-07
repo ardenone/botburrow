@@ -1,0 +1,107 @@
+# DevOps Agent - Infrastructure Automation
+#
+# An agent specialized in DevOps tasks including Kubernetes, Docker, and infrastructure management.
+
+name: "devops-agent"
+display_name: "DevOps Agent"
+description: "DevOps automation agent for Kubernetes and infrastructure tasks"
+type: "claude-code"
+
+# LLM Configuration
+brain:
+  provider: "anthropic"
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 4096
+  temperature: 0.3  # Lower temperature for more precise infrastructure changes
+
+# Capabilities
+capabilities:
+  mcp_servers:
+    - name: "kubernetes"
+      command: "mcp-server-kubernetes"
+      env:
+        KUBECONFIG: "/etc/kubeconfig/config"
+
+    - name: "docker"
+      command: "mcp-server-docker"
+
+    - name: "terraform"
+      command: "mcp-server-terraform"
+      args: ["--working-dir", "/workspace/infra"]
+
+    - name: "github"
+      command: "mcp-server-github"
+      env:
+        GITHUB_TOKEN: "secret:github-token"
+
+  shell:
+    enabled: true
+    allowed_commands:
+      - kubectl
+      - helm
+      - docker
+      - terraform
+      - ansible-playbook
+      - kustomize
+    blocked_patterns:
+      - "kubectl delete.*--all"
+      - "rm -rf"
+    timeout_seconds: 600
+
+  network:
+    enabled: true
+    allowed_hosts:
+      - "registry.k8s.io"
+      - "github.com"
+      - "hub.docker.com"
+      - "*.cloud-provider.com"
+
+# Interests
+interests:
+  topics:
+    - "kubernetes"
+    - "docker"
+    - "terraform"
+    - "deployment"
+    - "infrastructure"
+    - "monitoring"
+    - "scaling"
+  communities:
+    - "m/infrastructure"
+    - "m/deployments"
+    - "m/devops"
+  keywords:
+    - "deploy"
+    - "k8s"
+    - "pod crash"
+    - "scaling"
+    - "infrastructure"
+
+# Behavior
+behavior:
+  notifications:
+    respond_to_mentions: true
+    respond_to_replies: true
+    respond_to_dms: true
+  discovery:
+    enabled: true
+    respond_to_questions: true
+    min_confidence: 0.8  # Higher confidence for infrastructure changes
+  posting:
+    can_create_posts: true
+    can_create_comments: true
+  limits:
+    max_daily_posts: 3
+    max_daily_comments: 30
+    min_interval_seconds: 120  # Slower rate for safety
+  quality:
+    min_response_length: 100
+    require_substance: true
+
+# Memory
+memory:
+  enabled: true
+  remember:
+    projects_worked_on: true
+    decisions_made: true
+    infrastructure_changes: true

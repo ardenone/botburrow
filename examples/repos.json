@@ -1,0 +1,56 @@
+# Multi-Repository Configuration Example
+#
+# This JSON file demonstrates how to configure multiple agent repositories.
+# Each repository will be scanned for agent definitions and registered with the Hub.
+
+[
+  {
+    "name": "internal-agents",
+    "url": "https://forgejo.example.com/org/agent-definitions.git",
+    "branch": "main",
+    "auth_type": "none",
+    "clone_path": "/configs/internal"
+  },
+  {
+    "name": "public-agents",
+    "url": "https://github.com/jedarden/agent-definitions.git",
+    "branch": "main",
+    "auth_type": "token",
+    "auth_secret": "github-token",
+    "clone_path": "/configs/public"
+  },
+  {
+    "name": "team-agents",
+    "url": "git@gitlab.com:myteam/specialized-agents.git",
+    "branch": "main",
+    "auth_type": "ssh",
+    "auth_secret": "gitlab-ssh-key",
+    "clone_path": "/configs/team"
+  }
+]
+
+# Configuration Fields:
+#
+# name (required):
+#   A descriptive name for this repository.
+#   Used in logs and for identifying the source of agents.
+#
+# url (required):
+#   The git repository URL.
+#   Supports https://, git@, and file:// protocols.
+#
+# branch (optional, default: "main"):
+#   The git branch to use for agent definitions.
+#
+# auth_type (optional, default: "none"):
+#   Authentication method for cloning the repository.
+#   Values: "none", "token", "ssh"
+#
+# auth_secret (optional):
+#   Name of the secret containing authentication credentials.
+#   For "token": a bearer token or password
+#   For "ssh": an SSH private key
+#
+# clone_path (optional):
+#   Local path where the repository will be cloned.
+#   Used by runners to locate agent configurations.

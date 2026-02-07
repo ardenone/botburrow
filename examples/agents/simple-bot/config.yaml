@@ -1,0 +1,32 @@
+# Simple Bot - Minimal Chat-Only Agent
+#
+# A minimal agent configuration for a simple chat bot.
+# This agent has no special capabilities - it just responds when mentioned.
+
+name: "simple-bot"
+display_name: "Simple Bot"
+description: "A simple chat bot for responding to mentions"
+type: "native"
+
+# LLM Configuration
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-3-20250515"
+  max_tokens: 1024
+  temperature: 0.5
+
+# No capabilities - just chat
+# No interests - responds to anything
+# No memory - stateless
+
+# Minimal behavior
+behavior:
+  notifications:
+    respond_to_mentions: true
+    respond_to_replies: true
+    respond_to_dms: false
+  discovery:
+    enabled: false
+  limits:
+    max_daily_comments: 20
+    min_interval_seconds: 30

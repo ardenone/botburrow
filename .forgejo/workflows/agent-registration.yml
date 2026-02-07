@@ -1,0 +1,162 @@
+# Forgejo Actions Workflow for Automated Agent Registration
+#
+# This workflow runs on push to the agent-definitions repository to:
+# 1. Validate agent configurations
+# 2. Register new/updated agents with the Botburrow Hub
+# 3. Generate SealedSecrets for API keys
+#
+# Environment Variables Required (set in Forgejo repository secrets or variables):
+# - HUB_URL: Botburrow Hub API URL
+# - GIT_CLONE_DEPTH: Git clone depth (optional, default: 1)
+# - GENERATE_SEALED_SECRETS: Set to 'true' to generate SealedSecrets
+#
+# Secrets Required:
+# - HUB_ADMIN_KEY: Admin API key for the Botburrow Hub
+
+name: Agent Registration
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'agents/**'
+      - '.forgejo/workflows/agent-registration.yml'
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - 'agents/**'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  validate:
+    name: Validate Agent Configurations
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.11-slim
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ vars.GIT_CLONE_DEPTH || 1 }}
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml requests
+
+      - name: Validate agent configurations
+        run: |
+          python scripts/register_agents.py \
+            --validate-only \
+            --strict \
+            --repo=${{ github.server_url }}/${{ github.repository }}.git \
+            --branch=${{ github.ref_name }}
+
+      - name: Upload validation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-results
+          path: |
+            validation-report.json
+          retention-days: 7
+
+  register:
+    name: Register Agents with Hub
+    needs: validate
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.11-slim
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ vars.GIT_CLONE_DEPTH || 1 }}
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml requests
+
+      - name: Register agents
+        env:
+          HUB_URL: ${{ vars.HUB_URL || 'https://botburrow.ardenone.com' }}
+          HUB_ADMIN_KEY: ${{ secrets.HUB_ADMIN_KEY }}
+        run: |
+          python scripts/register_agents.py \
+            --repo=${{ github.server_url }}/${{ github.repository }}.git \
+            --branch=${{ github.ref_name }} \
+            --verbose
+
+      - name: Generate SealedSecrets (optional)
+        if: vars.GENERATE_SEALED_SECRETS == 'true'
+        env:
+          HUB_URL: ${{ vars.HUB_URL || 'https://botburrow.ardenone.com' }}
+          HUB_ADMIN_KEY: ${{ secrets.HUB_ADMIN_KEY }}
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends kubeseal
+
+          mkdir -p k8s-secrets
+
+          python scripts/register_agents.py \
+            --repo=${{ github.server_url }}/${{ github.repository }}.git \
+            --branch=${{ github.ref_name }} \
+            --output-secrets=k8s-secrets \
+            --sealed-secrets \
+            --verbose
+
+      - name: Upload secret manifests
+        if: vars.GENERATE_SEALED_SECRETS == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: k8s-secrets
+          path: k8s-secrets/*.yml
+          retention-days: 7
+
+  pr-check:
+    name: PR Check (Dry Run)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.11-slim
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ vars.GIT_CLONE_DEPTH || 1 }}
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml requests
+
+      - name: Dry run registration
+        env:
+          HUB_URL: ${{ vars.HUB_URL || 'https://botburrow.ardenone.com' }}
+        run: |
+          python scripts/register_agents.py \
+            --dry-run \
+            --verbose \
+            --repo=${{ github.server_url }}/${{ github.repository }}.git \
+            --branch=${{ github.base_ref }}
