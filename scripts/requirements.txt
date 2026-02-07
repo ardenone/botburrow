@@ -1,4 +1,4 @@
-# Requirements for agent registration script
+# Requirements for agent registration scripts
 # Install with: pip install -r scripts/requirements.txt
 
 # YAML parsing
@@ -6,3 +6,7 @@ pyyaml>=6.0
 
 # HTTP client for Hub API
 requests>=2.31.0
+
+# Additional dependencies for webhook sender
+# (optional - only needed for CI/CD webhook integration)
+# pydantic>=2.5.0  # For webhook data validation

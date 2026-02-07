@@ -924,11 +924,14 @@ Examples:
                             )
                             succeeded += 1
 
-                            # Store API key in validation data (masked)
+                            # Store API key in validation data (masked for report)
                             if "api_key" in result:
                                 api_key = result["api_key"]
                                 agent_data["api_key"] = api_key[:20] + "..." if len(api_key) > 20 else "***"
                                 agent_data["registered"] = True
+
+                                # Store full API key in separate field for webhook
+                                agent_data["full_api_key"] = api_key
 
                             # Generate secret manifest if requested
                             if args.output_secrets:
@@ -1012,6 +1015,30 @@ Examples:
         # Print markdown to stdout for CI consumption
         if args.verbose or args.dry_run:
             print("\n" + report.to_markdown())
+
+        # Output JSON results for webhook integration
+        webhook_results = []
+        for agent_data in agents_validation_data:
+            if agent_data.get("registered") and "full_api_key" in agent_data:
+                webhook_results.append({
+                    "name": agent_data["name"],
+                    "api_key": agent_data["full_api_key"],
+                    "config_source": agent_data.get("config_source", repos[0] if repos else "unknown"),
+                    "config_path": f"agents/{agent_data['name']}",
+                    "config_branch": args.branch,
+                })
+
+        if webhook_results:
+            webhook_file = Path("registration-results.json")
+            with open(webhook_file, "w") as f:
+                json.dump({
+                    "repository": repos[0] if repos else "local",
+                    "branch": args.branch,
+                    "commit_sha": commit_sha,
+                    "timestamp": datetime.now().isoformat(),
+                    "agents": webhook_results,
+                }, f, indent=2)
+            logger.info(f"Webhook results written to: {webhook_file}")
     else:
         # No agents found, print basic summary
         logger.info("=" * 60)

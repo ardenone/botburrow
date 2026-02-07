@@ -132,6 +132,27 @@ jobs:
           path: k8s-secrets/*.yml
           retention-days: 7
 
+      - name: Send webhook for SealedSecret generation (optional)
+        if: vars.SEND_WEBHOOK == 'true' && hashFiles('registration-results.json') != ''
+        env:
+          WEBHOOK_URL: ${{ vars.WEBHOOK_URL || 'https://botburrow.ardenone.com/api/v1/webhooks/agent-registration' }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          CI_REPOSITORY_URL: https://github.com/${{ github.repository }}.git
+          CI_BRANCH: ${{ github.ref_name }}
+          CI_COMMIT_SHA: ${{ github.sha }}
+          CI_RUN_ID: ${{ github.run_id }}
+          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python scripts/ci_webhook_sender.py \
+              --webhook-url="$WEBHOOK_URL" \
+              --webhook-secret="$WEBHOOK_SECRET" \
+              --repository="$CI_REPOSITORY_URL" \
+              --branch="$CI_BRANCH" \
+              --commit-sha="$CI_COMMIT_SHA" \
+              --run-id="$CI_RUN_ID" \
+              --run-url="$CI_RUN_URL" \
+              registration-results.json
+
       - name: Create summary comment
         if: always()
         run: |
