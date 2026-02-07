@@ -327,6 +327,63 @@ class AgentRepository:
         result = await self.session.execute(stmt)
         return result.rowcount > 0
 
+    async def update_api_key(
+        self,
+        agent_id: str,
+        new_api_key_hash: str,
+        old_key_hash: str,
+        grace_period_expires_at: datetime,
+        rotated_at: Optional[datetime] = None,
+    ) -> Optional[Agent]:
+        """Update an agent's API key and record the old key in history.
+
+        This method performs an atomic transaction-safe operation that:
+        1. Creates a history entry for the old API key
+        2. Updates the agent's api_key_hash to the new value
+
+        Args:
+            agent_id: Agent ID to update
+            new_api_key_hash: SHA256 hash of the new API key
+            old_key_hash: SHA256 hash of the old API key (for history)
+            grace_period_expires_at: When the old key expires (end of grace period)
+            rotated_at: Timestamp when the key was rotated (defaults to now)
+
+        Returns:
+            Updated Agent instance, or None if agent not found
+
+        Raises:
+            ValueError: If old_key_hash doesn't match current agent's api_key_hash
+        """
+        if rotated_at is None:
+            rotated_at = datetime.now()
+
+        # Get the current agent to verify the old key hash
+        agent = await self.get_by_id(agent_id)
+        if agent is None:
+            return None
+
+        # Verify that the old key hash matches
+        if agent.api_key_hash != old_key_hash:
+            raise ValueError(
+                f"Old API key hash mismatch for agent {agent_id}. "
+                f"Expected {agent.api_key_hash}, got {old_key_hash}"
+            )
+
+        # Create history entry for the old key
+        history_repo = ApiKeyHistoryRepository(self.session)
+        await history_repo.create(
+            agent_id=agent_id,
+            old_key_hash=old_key_hash,
+            rotated_at=rotated_at,
+            expires_at=grace_period_expires_at,
+        )
+
+        # Update the agent's API key hash
+        agent.api_key_hash = new_api_key_hash
+        await self.session.flush()
+
+        return agent
+
 
 class ApiKeyHistoryRepository:
     """Repository for API key history database operations."""
