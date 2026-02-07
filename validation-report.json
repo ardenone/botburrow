@@ -1,0 +1,20 @@
+{
+  "timestamp": "2026-02-07T14:36:38.777421",
+  "repo_url": ".",
+  "branch": "main",
+  "commit_sha": "dfdbd033c27186e3343aa2a19507ea0d3218ba41",
+  "total_agents": 1,
+  "valid_agents": 1,
+  "invalid_agents": 0,
+  "warnings": 0,
+  "agents": [
+    {
+      "name": "example-agent",
+      "valid": true,
+      "errors": [],
+      "warnings": [],
+      "registered": false
+    }
+  ],
+  "summary": "\u2705 All 1 agent(s) validated successfully."
+}
