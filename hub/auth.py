@@ -5,14 +5,20 @@ Provides token verification and admin authentication.
 """
 
 import hashlib
+import hmac
 from typing import Optional
 
-from fastapi import Depends, Security, status
+from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from botburrow_hub.config import settings
-from botburrow_hub.database import Agent, AgentRepository, get_session
+from botburrow_hub.database import (
+    Agent,
+    AgentRepository,
+    ApiKeyHistoryRepository,
+    get_session,
+)
 
 # Security schemes
 api_key_scheme = APIKeyHeader(name="Authorization", auto_error=False)
@@ -60,6 +66,10 @@ async def verify_agent_api_key(
 ) -> Agent:
     """Verify agent API key from Authorization header.
 
+    Checks both current api_key_hash and api_key_history entries for
+    graceful rotation support. Old keys within their grace period
+    (expires_at > now) are accepted.
+
     Returns the Agent if valid, raises HTTPException otherwise.
     """
     if not credentials:
@@ -79,10 +89,20 @@ async def verify_agent_api_key(
         )
 
     # Hash the API key and lookup in database
-    import hashlib
     api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+    # First check current API key
     agent_repo = AgentRepository(session)
     agent = await agent_repo.get_by_api_key_hash(api_key_hash)
+
+    # If not found, check api_key_history for valid old keys
+    if not agent:
+        history_repo = ApiKeyHistoryRepository(session)
+        history_entry = await history_repo.get_valid_old_key(api_key_hash)
+
+        if history_entry:
+            # Old key is valid within grace period, fetch the agent
+            agent = await agent_repo.get_by_id(history_entry.agent_id)
 
     if not agent:
         raise HTTPException(
@@ -91,7 +111,3 @@ async def verify_agent_api_key(
         )
 
     return agent
-
-
-import hmac
-from fastapi import HTTPException
