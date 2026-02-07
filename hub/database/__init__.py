@@ -8,12 +8,13 @@ including agent definitions with config source tracking.
 from dataclasses import dataclass
 from typing import Optional
 from datetime import datetime
+import uuid
 
 import sqlalchemy
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, update, delete, ForeignKey
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column
-from sqlalchemy.types import String, DateTime, Boolean, Integer, TIMESTAMP
+from sqlalchemy.types import String, DateTime, Boolean, Integer, TIMESTAMP, UUID
 from sqlalchemy.sql import func
 
 
@@ -91,6 +92,55 @@ class Agent(Base):
             "is_admin": self.is_admin,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class ApiKeyHistory(Base):
+    """API key history model for rotation tracking with grace period support."""
+
+    __tablename__ = "api_key_history"
+
+    # Primary key
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+
+    # Foreign key to agents table
+    agent_id: Mapped[str] = mapped_column(
+        String, ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    # Old API key hash (SHA256) for authentication during grace period
+    old_key_hash: Mapped[str] = mapped_column(
+        String, nullable=False, index=True,
+        comment="SHA256 hash of old API key"
+    )
+
+    # When the key was rotated (new key became active)
+    rotated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now(),
+        comment="Timestamp when the key was rotated"
+    )
+
+    # When the old key expires (end of grace period)
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, index=True,
+        comment="Timestamp when the old key expires (end of grace period)"
+    )
+
+    # Metadata
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def to_dict(self) -> dict:
+        """Convert API key history entry to dictionary for API responses."""
+        return {
+            "id": str(self.id),
+            "agent_id": self.agent_id,
+            "rotated_at": self.rotated_at.isoformat() if self.rotated_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
@@ -276,3 +326,135 @@ class AgentRepository:
         stmt = delete(Agent).where(Agent.id == agent_id)
         result = await self.session.execute(stmt)
         return result.rowcount > 0
+
+
+class ApiKeyHistoryRepository:
+    """Repository for API key history database operations."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def create(
+        self,
+        agent_id: str,
+        old_key_hash: str,
+        rotated_at: datetime,
+        expires_at: datetime,
+    ) -> ApiKeyHistory:
+        """Create a new API key history entry when rotating keys.
+
+        Args:
+            agent_id: Agent ID (foreign key)
+            old_key_hash: SHA256 hash of the old API key
+            rotated_at: Timestamp when the key was rotated
+            expires_at: Timestamp when the old key expires (end of grace period)
+
+        Returns:
+            Created ApiKeyHistory instance
+        """
+        history_entry = ApiKeyHistory(
+            agent_id=agent_id,
+            old_key_hash=old_key_hash,
+            rotated_at=rotated_at,
+            expires_at=expires_at,
+        )
+        self.session.add(history_entry)
+        await self.session.flush()
+        return history_entry
+
+    async def get_by_id(self, history_id: str) -> Optional[ApiKeyHistory]:
+        """Get API key history entry by ID."""
+        stmt = select(ApiKeyHistory).where(ApiKeyHistory.id == history_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_by_old_key_hash(self, old_key_hash: str) -> Optional[ApiKeyHistory]:
+        """Get API key history entry by old key hash."""
+        stmt = select(ApiKeyHistory).where(
+            ApiKeyHistory.old_key_hash == old_key_hash
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_valid_old_key(
+        self, old_key_hash: str, now: Optional[datetime] = None
+    ) -> Optional[ApiKeyHistory]:
+        """Get valid old key entry that hasn't expired yet.
+
+        Args:
+            old_key_hash: SHA256 hash of the old API key
+            now: Current time (defaults to now if not provided)
+
+        Returns:
+            ApiKeyHistory if key is still valid (within grace period), None otherwise
+        """
+        if now is None:
+            now = datetime.now()
+
+        stmt = select(ApiKeyHistory).where(
+            ApiKeyHistory.old_key_hash == old_key_hash,
+            ApiKeyHistory.expires_at > now,
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_by_agent(
+        self,
+        agent_id: str,
+        active_only: bool = False,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> list[ApiKeyHistory]:
+        """List API key history entries for an agent.
+
+        Args:
+            agent_id: Agent ID
+            active_only: If True, only return entries that haven't expired
+            offset: Pagination offset
+            limit: Maximum number of results
+
+        Returns:
+            List of ApiKeyHistory entries
+        """
+        stmt = (
+            select(ApiKeyHistory)
+            .where(ApiKeyHistory.agent_id == agent_id)
+            .order_by(ApiKeyHistory.rotated_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+
+        if active_only:
+            stmt = stmt.where(ApiKeyHistory.expires_at > func.now())
+
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def delete_expired(self, now: Optional[datetime] = None) -> int:
+        """Delete expired API key history entries.
+
+        Args:
+            now: Current time (defaults to now if not provided)
+
+        Returns:
+            Number of entries deleted
+        """
+        if now is None:
+            now = datetime.now()
+
+        stmt = delete(ApiKeyHistory).where(ApiKeyHistory.expires_at <= now)
+        result = await self.session.execute(stmt)
+        return result.rowcount
+
+    async def delete_by_agent(self, agent_id: str) -> int:
+        """Delete all API key history entries for an agent.
+
+        Args:
+            agent_id: Agent ID
+
+        Returns:
+            Number of entries deleted
+        """
+        stmt = delete(ApiKeyHistory).where(ApiKeyHistory.agent_id == agent_id)
+        result = await self.session.execute(stmt)
+        return result.rowcount
