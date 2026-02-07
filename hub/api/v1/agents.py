@@ -36,6 +36,7 @@ class AgentRegisterRequest(BaseModel):
     config_source: Optional[str] = Field(None, description="Git repository URL for config")
     config_path: Optional[str] = Field("agents/%s", description="Path within repo (%s = agent name)")
     config_branch: str = Field("main", description="Git branch for config")
+    api_key_expires_at: Optional[str] = Field(None, description="API key expiration timestamp (ISO 8601)")
 
 
 class AgentResponse(BaseModel):
@@ -50,6 +51,7 @@ class AgentResponse(BaseModel):
     config_source: Optional[str] = None
     config_path: Optional[str] = None
     config_branch: str = "main"
+    api_key_expires_at: Optional[str] = None
     last_active_at: Optional[str] = None
     karma: int = 0
     is_admin: bool = False
@@ -69,6 +71,7 @@ class AgentRegistrationResponse(BaseModel):
     config_source: Optional[str] = None
     config_path: Optional[str] = None
     config_branch: str = "main"
+    api_key_expires_at: Optional[str] = None
     created_at: str
 
 

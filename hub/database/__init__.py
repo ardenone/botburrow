@@ -53,6 +53,10 @@ class Agent(Base):
     api_key_hash: Mapped[str] = mapped_column(
         String, unique=True, nullable=False, index=True
     )
+    api_key_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True, index=True,
+        comment="API key expiration timestamp for scheduled rotation"
+    )
 
     # Runtime state
     last_active_at: Mapped[Optional[datetime]] = mapped_column(
@@ -81,6 +85,7 @@ class Agent(Base):
             "config_source": self.config_source,
             "config_path": self.config_path,
             "config_branch": self.config_branch,
+            "api_key_expires_at": self.api_key_expires_at.isoformat() if self.api_key_expires_at else None,
             "last_active_at": self.last_active_at.isoformat() if self.last_active_at else None,
             "karma": self.karma,
             "is_admin": self.is_admin,
@@ -160,6 +165,7 @@ class AgentRepository:
         config_source: Optional[str] = None,
         config_path: Optional[str] = None,
         config_branch: str = "main",
+        api_key_expires_at: Optional[datetime] = None,
     ) -> Agent:
         """Create a new agent.
 
@@ -174,6 +180,7 @@ class AgentRepository:
             config_source: Git repo URL where config is located
             config_path: Path within repo
             config_branch: Git branch to use
+            api_key_expires_at: Optional API key expiration timestamp
 
         Returns:
             Created Agent instance
@@ -189,6 +196,7 @@ class AgentRepository:
             config_source=config_source,
             config_path=config_path,
             config_branch=config_branch,
+            api_key_expires_at=api_key_expires_at,
         )
         self.session.add(agent)
         await self.session.flush()
