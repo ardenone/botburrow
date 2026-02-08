@@ -1,18 +1,29 @@
-# Forgejo ↔ GitHub Sync: Simplified Setup Guide
+# Forgejo ↔ GitHub Sync: Workaround Implementation
 
 ## Status
-**Alternative Implementation** for bd-145 (Set up Forgejo ↔ GitHub bidirectional sync)
+**Workaround Implementation** for bd-i1c (Alternative: Use workaround approach)
 
-This is a simplified approach that focuses on minimal viable implementation.
+This is a pragmatic workaround that uses GitHub as the primary Git host while Forgejo is blocked on RBAC issues.
 
-## Prerequisites
+## Workaround Strategy
 
-1. **Forgejo pod must be running** - Currently blocked on RBAC permissions (see bd-2we)
-2. **GitHub Personal Access Token** with repo permissions
-3. **GitHub repositories** created:
-   - `jedarden/agent-definitions` (private)
-   - `ardenone/botburrow-hub` (public)
-   - `ardenone/botburrow-agents` (public)
+**Current Situation:**
+- Forgejo pod is in CrashLoopBackOff due to s6-overlay permission error
+- Fix exists in commit 1a3e8cbfe but cannot be applied due to RBAC restrictions (bd-3vqp)
+- The workaround allows development work to continue using GitHub as primary
+
+**Workaround Approach:**
+- Use GitHub as primary Git host for all botburrow repositories
+- Document migration path for when Forgejo becomes available
+- Maintain synchronization readiness for future Forgejo deployment
+
+## GitHub Repository Status (Verified ✓)
+
+| Repository | Owner | Visibility | URL | Status |
+|------------|-------|------------|-----|--------|
+| agent-definitions | jedarden | Private | github.com/jedarden/agent-definitions | ✓ Exists |
+| botburrow-hub | ardenone | Public | github.com/ardenone/botburrow-hub | ✓ Exists |
+| botburrow-agents | ardenone | Public | github.com/ardenone/botburrow-agents | ✓ Exists |
 
 ## Architecture (Simplified)
 
@@ -30,88 +41,91 @@ Manual pull from GitHub via Forgejo UI or API
 - Manual disaster recovery instead of automated pull mirror on restart
 - Focus on push sync (Forgejo → GitHub) as primary use case
 
-## Setup Steps
+## Current Workaround Mode: GitHub-First
 
-### Step 1: Ensure Forgejo is Running
+### Using GitHub as Primary Git Host
 
-The deployment fix has been committed but requires RBAC permissions to apply.
+Until Forgejo is healthy, all repositories operate directly from GitHub:
 
 ```bash
-# Verify pod status
-kubectl --kubeconfig=/home/coder/.kube/apexalgo-iad.kubeconfig get pods -n forgejo
+# botburrow research repo
+cd /home/coder/research/botburrow
+git remote -v  # origin points to github.com/ardenone/botburrow
 
-# Current status (as of 2026-02-08):
-# NAME: forgejo-6744c7dc-64stz
-# STATUS: CrashLoopBackOff (s6-overlay permission error)
-# FIX: Committed in ardenone-cluster, needs RBAC to apply
+# agent-definitions repo
+git clone https://github.com/jedarden/agent-definitions.git
+
+# botburrow-hub repo
+git clone https://github.com/ardenone/botburrow-hub.git
+
+# botburrow-agents repo
+git clone https://github.com/ardenone/botburrow-agents.git
 ```
 
-**Action Required:** Resolve bd-2we (HUMAN: RBAC permission needed)
+### GitHub Actions CI/CD
 
-### Step 2: Create GitHub Repositories
+All repositories have GitHub Actions workflows configured:
+- `.github/workflows/` runs on push to GitHub
+- Tests, validation, and deployment automation
+- No changes needed - workflows run as designed
+
+## Migration Path: When Forgejo Becomes Available
+
+### Prerequisites for Migration
+
+1. **Resolve bd-3vqp** - Get RBAC permissions to apply Forgejo deployment fix
+2. **Apply deployment fix** - `kubectl apply -f cluster-configuration/apexalgo-iad/forgejo/deployment.yaml`
+3. **Verify Forgejo is healthy** - Pod should be Running (not CrashLoopBackOff)
+
+### Migration Steps (When Forgejo is Ready)
+
+#### Step 1: Create Forgejo Repositories
 
 ```bash
-# Create GitHub repos (if not exists)
-gh repo create jedarden/agent-definitions --private
-gh repo create ardenone/botburrow-hub --public
-gh repo create ardenone/botburrow-agents --public
-```
+# Generate admin token
+FORGEJO_ADMIN_TOKEN="xxx"  # From Forgejo UI or API
 
-### Step 3: Create Forgejo Repositories
-
-Once Forgejo is running, create repositories via UI or API:
-
-**Via Forgejo UI:**
-1. Navigate to https://botburrow-git.ardenone.com
-2. Login with admin credentials
-3. Create organization "botburrow" (if not exists)
-4. Create repositories:
-   - `agent-definitions`
-   - `botburrow-hub`
-   - `botburrow-agents`
-
-**Via API:**
-```bash
-FORGEJO_TOKEN="your-forgejo-admin-token"
-
-# Create organization
+# Create botburrow organization
 curl -X POST "https://botburrow-git.ardenone.com/api/v1/orgs" \
-  -H "Authorization: token $FORGEJO_TOKEN" \
+  -H "Authorization: token $FORGEJO_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"username": "botburrow", "visibility": "public"}'
 
 # Create repositories
 for repo in agent-definitions botburrow-hub botburrow-agents; do
+  private="false"
+  if [ "$repo" = "agent-definitions" ]; then
+    private="true"
+  fi
   curl -X POST "https://botburrow-git.ardenone.com/api/v1/org/botburrow/repos" \
-    -H "Authorization: token $FORGEJO_TOKEN" \
+    -H "Authorization: token $FORGEJO_ADMIN_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"name\": \"$repo\", \"private\": false}"
+    -d "{\"name\": \"$repo\", \"private\": $private}"
 done
 ```
 
-### Step 4: Configure Push Mirrors
+#### Step 2: Push Initial Content to Forgejo
 
-**Via Forgejo UI:**
-For each repository:
-1. Go to Repository Settings → Mirror Sync
-2. Add push mirror:
-   - Remote URL: `https://github.com/{owner}/{repo}.git`
-   - Username: GitHub username
-   - Password: GitHub Personal Access Token
-   - Interval: 1 hour
-   - ✅ Sync on Commit
+```bash
+# For each repo, add Forgejo remote and push
+cd /path/to/repo
+git remote add forgejo https://botburrow-git.ardenone.com/botburrow/REPO.git
+git push forgejo main
+```
 
-**Via API:**
+#### Step 3: Configure Push Mirrors (Forgejo → GitHub)
+
 ```bash
 GITHUB_TOKEN="your-github-pat"
+GITHUB_USER="your-github-username"
 
 # agent-definitions
 curl -X POST "https://botburrow-git.ardenone.com/api/v1/repos/botburrow/agent-definitions/push_mirrors" \
-  -H "Authorization: token $FORGEJO_TOKEN" \
+  -H "Authorization: token $FORGEJO_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
     \"remote_address\": \"https://github.com/jedarden/agent-definitions.git\",
-    \"remote_username\": \"jedarden\",
+    \"remote_username\": \"$GITHUB_USER\",
     \"remote_password\": \"$GITHUB_TOKEN\",
     \"interval\": \"1h0m0s\",
     \"sync_on_commit\": true
@@ -119,11 +133,11 @@ curl -X POST "https://botburrow-git.ardenone.com/api/v1/repos/botburrow/agent-de
 
 # botburrow-hub
 curl -X POST "https://botburrow-git.ardenone.com/api/v1/repos/botburrow/botburrow-hub/push_mirrors" \
-  -H "Authorization: token $FORGEJO_TOKEN" \
+  -H "Authorization: token $FORGEJO_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
     \"remote_address\": \"https://github.com/ardenone/botburrow-hub.git\",
-    \"remote_username\": \"ardenone\",
+    \"remote_username\": \"$GITHUB_USER\",
     \"remote_password\": \"$GITHUB_TOKEN\",
     \"interval\": \"1h0m0s\",
     \"sync_on_commit\": true
@@ -131,88 +145,105 @@ curl -X POST "https://botburrow-git.ardenone.com/api/v1/repos/botburrow/botburro
 
 # botburrow-agents
 curl -X POST "https://botburrow-git.ardenone.com/api/v1/repos/botburrow/botburrow-agents/push_mirrors" \
-  -H "Authorization: token $FORGEJO_TOKEN" \
+  -H "Authorization: token $FORGEJO_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
     \"remote_address\": \"https://github.com/ardenone/botburrow-agents.git\",
-    \"remote_username\": \"ardenone\",
+    \"remote_username\": \"$GITHUB_USER\",
     \"remote_password\": \"$GITHUB_TOKEN\",
     \"interval\": \"1h0m0s\",
     \"sync_on_commit\": true
   }"
 ```
 
-### Step 5: Test Sync
+#### Step 4: Update Git Remotes (Optional)
+
+To make Forgejo the primary remote:
 
 ```bash
-# Clone from Forgejo
-git clone https://botburrow-git.ardenone.com/botburrow/botburrow-hub.git
-cd botburrow-hub
+# In each repository
+git remote set-url origin https://botburrow-git.ardenone.com/botburrow/REPO.git
+git remote add github https://github.com/OWNER/REPO.git
 
-# Make a test commit
-echo "test sync" > test-sync.txt
-git add test-sync.txt
-git commit -m "test: verify sync to GitHub"
+# Push to Forgejo becomes default
+git push origin main  # Pushes to Forgejo
+```
 
-# Push to Forgejo
+#### Step 5: Verify Bidirectional Sync
+
+```bash
+# Test push to Forgejo
+echo "test forgejo sync" > test-forgejo.txt
+git add test-forgejo.txt
+git commit -m "test: verify Forgejo → GitHub sync"
 git push origin main
 
-# Verify on GitHub (web or API)
-gh repo view ardenone/botburrow-hub
+# Verify on GitHub
+gh repo view OWNER/REPO  # Should show new commit
+
+# Clean up test file
+git rm test-forgejo.txt
+git commit -m "test: cleanup"
+git push origin main
 ```
 
-## Disaster Recovery (Manual)
+## Disaster Recovery (GitHub as Source of Truth)
 
-If Forgejo data is lost, repositories can be restored from GitHub:
+Since GitHub is the primary host during workaround mode:
 
-**Option A: Via Forgejo UI**
-1. Create new repository
-2. Repository Settings → Mirror Sync
-3. Add pull mirror from GitHub URL
-4. Sync will pull all content
-
-**Option B: Via API**
-```bash
-curl -X POST "https://botburrow-git.ardenone.com/api/v1/repos/migrate" \
-  -H "Authorization: token $FORGEJO_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"clone_addr\": \"https://github.com/ardenone/botburrow-hub.git\",
-    \"repo_name\": \"botburrow-hub\",
-    \"repo_owner\": \"botburrow\",
-    \"mirror\": true,
-    \"private\": false
-  }"
-```
+- **All code is safe on GitHub** - No risk of data loss from Forgejo being down
+- **Forgejo data loss is irrelevant** - Can be fully restored from GitHub when ready
+- **No manual intervention needed** - GitHub repos remain authoritative
 
 ## Verification Checklist
 
-- [ ] Forgejo pod is running (not CrashLoopBackOff)
-- [ ] GitHub repos exist (agent-definitions, botburrow-hub, botburrow-agents)
-- [ ] Forgejo repos exist in botburrow organization
-- [ ] Push mirrors configured with sync_on_commit: true
-- [ ] Test push to Forgejo appears on GitHub
-- [ ] GitHub token has correct permissions (Contents: Read/Write)
+### Workaround Mode (Current)
+- [x] GitHub repos exist and verified
+  - [x] jedarden/agent-definitions (private)
+  - [x] ardenone/botburrow-hub (public)
+  - [x] ardenone/botburrow-agents (public)
+- [x] GitHub Actions workflows configured
+- [x] Documentation updated with migration path
 
-## Current Status
+### Migration to Forgejo (Future)
+- [ ] Resolve bd-3vqp (RBAC permissions)
+- [ ] Apply Forgejo deployment fix
+- [ ] Verify Forgejo pod is Running
+- [ ] Create Forgejo repositories
+- [ ] Configure push mirrors to GitHub
+- [ ] Test bidirectional sync
 
-| Item | Status |
-|------|--------|
-| Forgejo Deployment | ❌ Blocked on RBAC (bd-2we) |
-| GitHub Repos | ❓ Need to verify/create |
-| Push Mirror Config | ⏸️ Waiting for Forgejo |
-| Sync Test | ⏸️ Waiting for Forgejo |
+## Current Status Summary
+
+| Item | Status | Notes |
+|------|--------|-------|
+| **GitHub Repos** | ✅ Verified | All three repos exist |
+| **GitHub Actions** | ✅ Working | CI/CD pipelines active |
+| **Forgejo Deployment** | ❌ Blocked | RBAC issue (bd-3vqp) |
+| **Push Mirror Config** | ⏸️ Deferred | Waiting for Forgejo |
+| **Bidirectional Sync** | ⏸️ Deferred | Waiting for Forgejo |
 
 ## Related Documents
 
-- **ADR-028**: Full bidirectional sync architecture (this is the simplified version)
+- **ADR-028**: Full bidirectional sync architecture
 - **Status Document**: `/home/coder/research/botburrow/docs/forgejo-github-sync-status.md`
 - **Deployment Fix**: Committed in ardenone-cluster repo (commit 1a3e8cbfe)
+- **RBAC Issue**: bead bd-3vqp in /home/coder workspace
 
-## Next Steps
+## Benefits of Workaround Approach
 
-1. **Resolve bd-2we** - Get RBAC permissions to apply Forgejo deployment fix
-2. **Create GitHub repos** - Verify all three repos exist
-3. **Follow setup steps** - Configure push mirrors manually
-4. **Test sync** - Verify bidirectional sync works
-5. **Close bd-2l0** - Mark this simplified alternative as complete
+### Immediate Benefits
+1. **Unblocks development** - Work can continue without waiting for Forgejo
+2. **Zero data loss risk** - GitHub is reliable and externally backed up
+3. **Full CI/CD functionality** - GitHub Actions workflows run as intended
+4. **No migration urgency** - Can migrate to Forgejo when convenient
+
+### Reduced Complexity
+1. **No mirror configuration** - Skip push mirror setup until Forgejo is ready
+2. **No webhook setup** - Skip GitHub webhook configuration
+3. **Simplified operations** - Single Git host reduces operational overhead
+
+### Clear Migration Path
+1. **Documented steps** - Migration procedure is clearly documented above
+2. **No breaking changes** - Migration is additive, not disruptive
+3. **Rollback-friendly** - Can stay on GitHub if Forgejo migration has issues
