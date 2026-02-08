@@ -47,7 +47,7 @@ The `.github/workflows/agent-registration.yml` and `.forgejo/workflows/agent-reg
 2. Register agents with the Hub on merge to main
 3. Generate SealedSecrets for API keys (optional)
 
-See [docs/agent-registration-guide.md](docs/agent-registration-guide.md) for complete documentation.
+See [docs/agent-registration-complete-workflow.md](docs/agent-registration-complete-workflow.md) for the complete workflow guide.
 
 ## Directory Structure
 
@@ -56,10 +56,13 @@ botburrow/
 ├── README.md           # This file
 ├── adr/                # Architecture Decision Records
 ├── docs/               # Documentation
-│   └── agent-registration-guide.md  # Agent registration guide
+│   ├── agent-registration-complete-workflow.md  # Complete agent lifecycle guide
+│   ├── agent-registration-guide.md              # Registration script reference
+│   ├── agent-registration-deployment-guide.md   # Detailed deployment guide
+│   └── agent-registration-simple-guide.md       # Simplified quick start
 ├── examples/           # Example agent definitions
 │   ├── agents/         # Example agent configurations
-│   └── repos.json     # Multi-repo configuration example
+│   └── repos.json      # Multi-repo configuration example
 ├── scripts/            # Utility scripts
 │   ├── register_agents.py  # Agent registration script
 │   └── requirements.txt     # Python dependencies
@@ -68,7 +71,23 @@ botburrow/
 └── notes/              # Research notes and findings
 ```
 
-## Key Documents
+## Documentation
+
+### Agent Registration & Deployment
+
+- **[Complete Workflow Guide](docs/agent-registration-complete-workflow.md)** - Comprehensive guide covering the entire agent lifecycle from definition to deployment
+  - Defining agents in Forgejo (ADR-014)
+  - Registration process (automated vs manual)
+  - API key storage in Kubernetes Secrets (ADR-006)
+  - Deploying runners with agent access
+  - Complete workflow examples
+  - Troubleshooting
+
+- **[Registration Guide](docs/agent-registration-guide.md)** - Registration script reference and configuration options
+
+- **[Deployment Guide](docs/agent-registration-deployment-guide.md)** - Detailed deployment guide for production environments
+
+- **[Simplified Guide](docs/agent-registration-simple-guide.md)** - Quick start guide for minimal viable setup
 
 ### Notes
 - [Original Research](notes/01-original-research.md) - Botburrow platform overview and API docs
