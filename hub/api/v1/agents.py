@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from botburrow_hub.auth import verify_admin_token, verify_agent_api_key
 from botburrow_hub.config import settings
 from botburrow_hub.database import Agent, AgentRepository, get_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -134,6 +135,7 @@ def hash_api_key(api_key: str) -> str:
 )
 async def register_agent(
     request: AgentRegisterRequest,
+    session: AsyncSession = Depends(get_session),
     _admin: str = Security(verify_admin_token),
 ) -> AgentRegistrationResponse:
     """Register a new agent with the Hub.
@@ -143,12 +145,27 @@ async def register_agent(
 
     The config_source, config_path, and config_branch fields allow runners
     to locate the agent's configuration in the correct git repository.
+
+    If an agent with the same name already exists, this will update the
+    existing agent's configuration while preserving its API key (unless
+    api_key_expires_at is set, in which case a new key is generated).
     """
-    # TODO: Implement with async database session
-    # For now, return a mock response
+
+    # Generate ID and API key
     agent_id = str(uuid.uuid4())
     api_key = generate_api_key()
     api_key_hash = hash_api_key(api_key)
+
+    # Parse API key expiration if provided
+    api_key_expires_at = None
+    if request.api_key_expires_at:
+        try:
+            api_key_expires_at = datetime.fromisoformat(request.api_key_expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid api_key_expires_at format. Use ISO 8601 format.",
+            )
 
     logger.info(
         f"Registering agent: {request.name} "
@@ -156,31 +173,71 @@ async def register_agent(
         f"config_source: {request.config_source})"
     )
 
-    # TODO: Store in database via AgentRepository
-    # agent = await agent_repo.create(
-    #     id=agent_id,
-    #     name=request.name,
-    #     api_key_hash=api_key_hash,
-    #     display_name=request.display_name,
-    #     description=request.description,
-    #     type=request.type,
-    #     avatar_url=request.avatar_url,
-    #     config_source=request.config_source,
-    #     config_path=request.config_path,
-    #     config_branch=request.config_branch,
-    # )
+    # Check if agent already exists
+    agent_repo = AgentRepository(session)
+    existing_agent = await agent_repo.get_by_name(request.name)
+
+    if existing_agent:
+        # Update existing agent
+        logger.info(f"Agent {request.name} already exists, updating configuration")
+        existing_agent.display_name = request.display_name
+        existing_agent.description = request.description
+        existing_agent.type = request.type
+        existing_agent.avatar_url = request.avatar_url
+        existing_agent.config_source = request.config_source
+        existing_agent.config_path = request.config_path
+        existing_agent.config_branch = request.config_branch
+
+        # Only update API key if expiration is set
+        if api_key_expires_at:
+            existing_agent.api_key_hash = api_key_hash
+            existing_agent.api_key_expires_at = api_key_expires_at
+
+        await session.flush()
+
+        # Use existing agent's data for response
+        response_agent = existing_agent
+        response_api_key = api_key if api_key_expires_at else None  # Only return new key if it was regenerated
+
+        # If no new key was generated, we can't return the old one (hash only)
+        # For updates without key regeneration, indicate no key change
+        if not response_api_key:
+            response_api_key = "(unchanged)"
+
+        status_code = status.HTTP_200_OK
+    else:
+        # Create new agent
+        agent = await agent_repo.create(
+            id=agent_id,
+            name=request.name,
+            api_key_hash=api_key_hash,
+            display_name=request.display_name,
+            description=request.description,
+            type=request.type,
+            avatar_url=request.avatar_url,
+            config_source=request.config_source,
+            config_path=request.config_path,
+            config_branch=request.config_branch,
+            api_key_expires_at=api_key_expires_at,
+        )
+        await session.commit()
+
+        response_agent = agent
+        response_api_key = api_key
+        status_code = status.HTTP_201_CREATED
 
     return AgentRegistrationResponse(
-        id=agent_id,
-        name=request.name,
-        api_key=api_key,
-        display_name=request.display_name,
-        description=request.description,
-        type=request.type,
-        config_source=request.config_source,
-        config_path=request.config_path % request.name if "%s" in (request.config_path or "") else request.config_path,
-        config_branch=request.config_branch,
-        created_at=datetime.now().isoformat(),
+        id=response_agent.id,
+        name=response_agent.name,
+        api_key=response_api_key,
+        display_name=response_agent.display_name,
+        description=response_agent.description,
+        type=response_agent.type,
+        config_source=response_agent.config_source,
+        config_path=response_agent.config_path,
+        config_branch=response_agent.config_branch,
+        api_key_expires_at=response_agent.api_key_expires_at.isoformat() if response_agent.api_key_expires_at else None,
+        created_at=response_agent.created_at.isoformat() if response_agent.created_at else datetime.now().isoformat(),
     )
 
 
