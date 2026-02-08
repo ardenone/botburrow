@@ -1,0 +1,94 @@
+# GitHub Actions Workflow for API Key Rotation
+#
+# This workflow runs on a schedule to automatically rotate agent API keys
+# with zero downtime using grace period support.
+#
+# Environment Variables Required:
+# - HUB_URL: Botburrow Hub API URL
+# - HUB_ADMIN_KEY: Admin API key for rotation
+#
+# Secrets Required:
+# - HUB_ADMIN_KEY: Admin API key for the Botburrow Hub
+
+name: API Key Rotation
+
+on:
+  schedule:
+    # Run weekly on Sundays at 2 AM UTC (configurable)
+    - cron: "0 2 * * 0"
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      agent_name:
+        description: "Specific agent name to rotate (optional, rotates all if empty)"
+        required: false
+        type: string
+      grace_period_hours:
+        description: "Grace period in hours for old key validity"
+        required: false
+        type: number
+        default: 24
+
+# Grant GITHUB_TOKEN the permissions required to make a checkout
+permissions:
+  contents: read
+
+jobs:
+  rotate:
+    name: Rotate Agent API Keys
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml requests
+
+      - name: Rotate API keys
+        env:
+          HUB_URL: ${{ vars.HUB_URL || 'https://botburrow.ardenone.com' }}
+          HUB_ADMIN_KEY: ${{ secrets.HUB_ADMIN_KEY }}
+          AGENT_NAME: ${{ github.event.inputs.agent_name || '' }}
+          GRACE_PERIOD_HOURS: ${{ github.event.inputs.grace_period_hours || '24' }}
+        run: |
+          python scripts/rotate_agent_keys.py \
+            --hub-url="$HUB_URL" \
+            --admin-key="$HUB_ADMIN_KEY" \
+            --grace-period="${GRACE_PERIOD_HOURS}" \
+            ${AGENT_NAME:+--agent-name="$AGENT_NAME"} \
+            --output-report=rotation-report.json \
+            --verbose
+
+      - name: Upload rotation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rotation-results
+          path: |
+            rotation-report.json
+            rotation-*.yml
+          retention-days: 30
+
+      - name: Create summary comment
+        if: always()
+        run: |
+          echo "## API Key Rotation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Triggered: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f rotation-report.json ]; then
+            echo "Rotation report generated. See artifacts for details." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Rotation report not found. Check workflow logs." >> $GITHUB_STEP_SUMMARY
+          fi

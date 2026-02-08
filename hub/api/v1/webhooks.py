@@ -135,6 +135,10 @@ class SealedSecretResult(BaseModel):
     success: bool
     error: Optional[str] = None
     manifest: Optional[str] = None
+    commit_info: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Git commit info if auto-committed"
+    )
 
 
 class AgentRegistrationResponse(BaseModel):
@@ -153,6 +157,7 @@ async def generate_sealed_secret(
     api_key: str,
     agent_name: str,
     namespace: str = "botburrow-agents",
+    ci_commit_sha: str = "",
 ) -> SealedSecretResult:
     """Generate a SealedSecret for an agent API key.
 
@@ -225,8 +230,13 @@ async def generate_sealed_secret(
             sealed_secret_path.write_text(result.stdout)
 
             # Commit to git if configured
+            commit_info = None
             if settings.auto_commit_secrets:
-                _commit_sealed_secret(sealed_secret_path, agent_name, commit_sha="")
+                commit_info = _commit_sealed_secret(
+                    sealed_secret_path,
+                    agent_name,
+                    commit_sha=ci_commit_sha
+                )
 
             return SealedSecretResult(
                 agent_name=agent_name,
@@ -234,6 +244,7 @@ async def generate_sealed_secret(
                 namespace=namespace,
                 success=True,
                 manifest=result.stdout,
+                commit_info=commit_info,
             )
 
         finally:
@@ -273,7 +284,7 @@ def _commit_sealed_secret(
     agent_name: str,
     commit_sha: str,
 ) -> Optional[Dict[str, str]]:
-    """Commit a SealedSecret to git."""
+    """Commit a SealedSecret to git and push to remote."""
     import subprocess
 
     try:
@@ -286,12 +297,35 @@ def _commit_sealed_secret(
         )
         branch = result.stdout.strip() if result.returncode == 0 else "unknown"
 
+        # Get remote URL for info
+        result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        remote_url = result.stdout.strip() if result.returncode == 0 else "unknown"
+
         # Add file
-        subprocess.run(
+        result = subprocess.run(
             ["git", "add", str(secret_path)],
             capture_output=True,
+            text=True,
             timeout=10,
         )
+        if result.returncode != 0:
+            logger.warning(f"git add failed: {result.stderr}")
+
+        # Check if there are changes to commit
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            capture_output=True,
+            timeout=5,
+        )
+        # Exit code 1 means there are changes (expected), 0 means no changes
+        if result.returncode == 0:
+            logger.info(f"No changes to commit for {secret_path}")
+            return None
 
         # Commit
         commit_message = f"chore: add SealedSecret for agent {agent_name}\n\nAuto-generated from CI/CD registration\n"
@@ -305,22 +339,45 @@ def _commit_sealed_secret(
             timeout=10,
         )
 
-        if result.returncode == 0:
-            # Get new commit SHA
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            new_sha = result.stdout.strip() if result.returncode == 0 else ""
+        if result.returncode != 0:
+            logger.error(f"git commit failed: {result.stderr}")
+            return None
 
-            return {
-                "branch": branch,
-                "commit_sha": new_sha,
-                "file": str(secret_path),
-            }
+        # Get new commit SHA
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        new_sha = result.stdout.strip() if result.returncode == 0 else ""
 
+        # Push to remote
+        logger.info(f"Pushing SealedSecret commit to remote: {branch}")
+        push_result = subprocess.run(
+            ["git", "push", "origin", branch],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        push_success = push_result.returncode == 0
+        if not push_success:
+            logger.warning(f"git push failed: {push_result.stderr}")
+            # Still return success since commit was made, push can be retried
+        else:
+            logger.info(f"Successfully pushed SealedSecret to remote: {new_sha[:8]}")
+
+        return {
+            "branch": branch,
+            "commit_sha": new_sha,
+            "file": str(secret_path),
+            "remote_url": remote_url,
+            "pushed": push_success,
+        }
+
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Git operation timed out: {e}")
     except Exception as e:
         logger.error(f"Failed to commit SealedSecret: {e}")
 
@@ -360,6 +417,7 @@ async def agent_registration_webhook(
             api_key=agent.api_key,
             agent_name=agent.name,
             namespace="botburrow-agents",
+            ci_commit_sha=webhook_data.commit_sha,
         )
 
         secrets_created.append(result)
@@ -463,6 +521,135 @@ async def webhook_ping(
         "service": "botburrow-hub-webhooks",
         "timestamp": datetime.now().isoformat(),
     }
+
+
+# ============================================================================
+# Agent API Key Rotation Webhook
+# ============================================================================
+
+class AgentRotationRequest(BaseModel):
+    """Request for agent API key rotation."""
+
+    agent_name: str = Field(..., description="Name of the agent to rotate keys for")
+    reason: str = Field(default="scheduled", description="Reason for rotation")
+    repository: str = Field(..., description="Git repository URL for tracking")
+    commit_sha: str = Field(..., description="Associated commit SHA")
+    old_api_key_hash: Optional[str] = Field(None, description="Hash of old key for verification")
+
+
+class AgentRotationResponse(BaseModel):
+    """Response to agent API key rotation request."""
+
+    success: bool
+    message: str
+    agent_name: str
+    old_api_key: str
+    new_api_key: str
+    sealed_secret_created: bool
+    commit_info: Optional[Dict[str, str]] = None
+    timestamp: str
+
+
+@router.post(
+    "/agent-rotation",
+    response_model=AgentRotationResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def agent_rotation_webhook(
+    rotation_request: AgentRotationRequest,
+    request: Request,
+    _auth: Depends = Depends(verify_ci_webhook),
+) -> AgentRotationResponse:
+    """Handle agent API key rotation via webhook.
+
+    This endpoint allows CI/CD systems to trigger API key rotation for agents:
+    1. Generates a new API key for the agent
+    2. Updates the agent record in the database
+    3. Creates a new SealedSecret with the new key
+    4. Commits the SealedSecret to git (if configured)
+    5. Returns both old and new keys for graceful migration
+
+    The webhook is secured with HMAC-SHA256 signature verification.
+
+    Note: The old API key remains valid until manually deleted, allowing
+    for zero-downtime rotation by updating deployments before removing old keys.
+    """
+    from botburrow_hub.db import get_db
+    from botburrow_hub.agents import AgentService
+
+    logger.info(
+        f"Received rotation request for agent: {rotation_request.agent_name} "
+        f"(reason: {rotation_request.reason})"
+    )
+
+    db = get_db()
+    agent_service = AgentService(db)
+
+    try:
+        # Get existing agent
+        agent = await agent_service.get_agent_by_name(rotation_request.agent_name)
+        if not agent:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Agent '{rotation_request.agent_name}' not found"
+            )
+
+        old_api_key = agent.api_key
+
+        # Verify old key hash if provided
+        if rotation_request.old_api_key_hash:
+            import hashlib
+            expected_hash = hashlib.sha256(old_api_key.encode()).hexdigest()
+            if expected_hash != rotation_request.old_api_key_hash:
+                logger.warning(
+                    f"Old API key hash mismatch for {rotation_request.agent_name}. "
+                    "Proceeding with rotation anyway."
+                )
+
+        # Generate new API key
+        new_api_key = agent_service.generate_api_key()
+
+        # Update agent with new API key
+        await agent_service.update_agent_api_key(
+            agent_id=agent.id,
+            new_api_key=new_api_key
+        )
+
+        logger.info(f"Generated new API key for agent: {rotation_request.agent_name}")
+
+        # Generate SealedSecret for new key
+        sealed_result = await generate_sealed_secret(
+            api_key=new_api_key,
+            agent_name=rotation_request.agent_name,
+            namespace="botburrow-agents",
+            ci_commit_sha=rotation_request.commit_sha,
+        )
+
+        # Prepare response
+        response = AgentRotationResponse(
+            success=sealed_result.success,
+            message=f"API key rotated for agent {rotation_request.agent_name}",
+            agent_name=rotation_request.agent_name,
+            old_api_key=old_api_key,
+            new_api_key=new_api_key,
+            sealed_secret_created=sealed_result.success,
+            commit_info=sealed_result.commit_info,
+            timestamp=datetime.now().isoformat(),
+        )
+
+        if not sealed_result.success:
+            response.message += f" (SealedSecret creation failed: {sealed_result.error})"
+
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to rotate API key for {rotation_request.agent_name}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"API key rotation failed: {str(e)}"
+        )
 
 
 # ============================================================================

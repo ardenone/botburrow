@@ -214,10 +214,11 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const reportExists = '${{ steps.report.outputs.report_exists }}' === 'true';
+            const reportContent = `${{ steps.report.outputs.content }}`;
 
             let commentBody;
             if (reportExists) {
-              commentBody = `${{ steps.report.outputs.content }}`;
+              commentBody = reportContent;
             } else {
               commentBody = `## Agent Registration Dry Run Results
 
@@ -257,5 +258,15 @@ jobs:
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
                 body: commentBody
+              });
+            }
+
+            // Set PR status based on validation results
+            const hasErrors = reportContent && reportContent.includes('### ❌ Validation Errors');
+            const hasBlockers = hasErrors || !reportExists;
+
+            if (hasBlockers) {
+              core.setFailed('Agent validation failed. Please fix the errors before merging.');
+            }
               });
             }
