@@ -1,8 +1,8 @@
 {
-  "timestamp": "2026-02-08T05:29:41.231956",
-  "repo_url": ".",
+  "timestamp": "2026-02-08T05:57:13.353778",
+  "repo_url": "https://github.com/ardenone/botburrow.git",
   "branch": "main",
-  "commit_sha": "64ab88bab5f430f8508458eb217fa48e42836086",
+  "commit_sha": "82028fc85f60a778399ec40b8a288bbe7e4ef0d0",
   "total_agents": 1,
   "valid_agents": 1,
   "invalid_agents": 0,
@@ -13,7 +13,7 @@
       "valid": true,
       "errors": [],
       "warnings": [],
-      "config_source": ".",
+      "config_source": "https://github.com/ardenone/botburrow.git",
       "config_path": "agents/example-agent",
       "config_branch": "main",
       "registered": false
