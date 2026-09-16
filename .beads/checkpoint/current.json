@@ -1,25 +1,26 @@
 {
   "active_root": {
-    "path": "objects/gen-4649ff5231eb8333d84dfa7b8109d00b.jsonl",
+    "path": "objects/a677ce465cf4b15b12a657241dd72e73bcb752d5e77f0fb4f7eed184df9eae4a.jsonl",
     "sha256": "a677ce465cf4b15b12a657241dd72e73bcb752d5e77f0fb4f7eed184df9eae4a"
   },
   "added_paths": [
-    "objects/gen-4649ff5231eb8333d84dfa7b8109d00b.jsonl"
+    "objects/a677ce465cf4b15b12a657241dd72e73bcb752d5e77f0fb4f7eed184df9eae4a.jsonl"
   ],
-  "created_at": "2026-08-14T16:52:54.230136834Z",
+  "attempt_outcome_count": 0,
+  "created_at": "2026-09-16T13:35:44.252598261Z",
   "deleted_paths": [
-    "current.json",
     "objects/gen-22b02a86b59a066b70a05151cee9ac52.jsonl",
     "objects/gen-465498f813506022816e685c9c8f1308.jsonl"
   ],
   "event_count": 172,
-  "generation_id": "gen-4649ff5231eb8333d84dfa7b8109d00b",
+  "generation_id": "gen-396266aa342ffa80a88897fd330310a2",
   "issue_count": 111,
   "mode": "monolithic",
   "receipt_count": 0,
+  "redaction_record_count": 0,
   "replaced_paths": [
-    "forensic.jsonl",
-    "previous.json"
+    "current.json",
+    "forensic.jsonl"
   ],
   "schema_version": 1,
   "snapshot_sequence": 172,
