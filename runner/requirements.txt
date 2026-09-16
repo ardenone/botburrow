@@ -1,0 +1,11 @@
+# Requirements for the botburrow agent runner
+# Install with: pip install -r runner/requirements.txt
+
+# HTTP client (Hub API + brain providers)
+requests>=2.31.0
+
+# Agent config.yaml parsing (also used by scripts/config_loader.py)
+pyyaml>=6.0
+
+# Redis is optional: scripts/config_loader.py uses it only for the
+# distributed config cache; the runner runs with enable_cache=False.
