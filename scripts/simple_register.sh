@@ -2,9 +2,8 @@
 #
 # Simple Agent Registration Wrapper
 #
-# WORKAROUND: This is a simplified registration script that bypasses
-# the full CI/CD automation while still providing validation and
-# structured output.
+# This is a small wrapper around register_agents.py. Registration writes the
+# Hub-generated key to OpenBao; this wrapper only displays the safe reference.
 #
 # Usage:
 #   ./scripts/simple_register.sh [--repo <url>] [--validate-only] [--help]
@@ -15,8 +14,9 @@
 #
 # Output:
 #   - Validation report on stdout
-#   - API keys displayed for manual SealedSecret creation
-#   - Secret templates in ./secrets-output/ directory
+#   - OpenBao retrieval paths for registered agents
+#   - Validation reports in ./secrets-output/ (the directory name is retained
+#     for compatibility; it never contains secret values)
 #
 
 set -euo pipefail
@@ -54,7 +54,7 @@ OPTIONS:
     --repo <url>         Git repository URL containing agent definitions
     --branch <name>      Git branch (default: main)
     --validate-only      Only validate, don't register
-    --output-dir <path>  Output directory for secrets (default: ./secrets-output)
+    --output-dir <path>  Output directory for reports (default: ./secrets-output)
     --help               Show this help message
 
 ENVIRONMENT VARIABLES:
@@ -66,24 +66,21 @@ EXAMPLES:
     export REPO_URL="https://github.com/org/agent-definitions.git"
     ./scripts/simple_register.sh --validate-only
 
-    # Register agents (requires HUB_ADMIN_KEY)
-    export HUB_ADMIN_KEY="your-admin-key"
+    # Register agents (requires HUB_ADMIN_KEY and an OpenBao provisioning identity)
+    export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+      secret/ardenone-cluster/botburrow/botburrow-hub)"
+    export OPENBAO_TOKEN_FILE="/run/secrets/openbao-token"
     ./scripts/simple_register.sh --repo https://github.com/org/agent-definitions.git
 
     # Register with custom branch
     ./scripts/simple_register.sh --repo https://github.com/org/agents.git --branch develop
 
 OUTPUT:
-    After successful registration, API keys are displayed and secret templates
-    are written to ./secrets-output/. Use these to create SealedSecrets manually.
+    After successful registration, only each agent's OpenBao retrieval path is
+    displayed. The generated key is never printed or written to a file.
 
-CREATING SEALED SECRETS:
-    1. Install kubeseal: https://github.com/bitnami-labs/sealed-secrets
-    2. For each secret template:
-       kubeseal --format yaml < secrets-output/agent-<name>-secret.template \\
-         > cluster-config/agent-<name>-sealedsecret.yml
-    3. Apply the sealed secret:
-       kubectl apply -f cluster-config/agent-<name>-sealedsecret.yml
+    Configure an ExternalSecret/secret sync for the OpenBao path so runners
+    receive the key through Kubernetes Secret data.
 
 EOF
 }
@@ -145,7 +142,7 @@ if [[ -z "$REPO_URL" ]]; then
 fi
 
 # Check if HUB_ADMIN_KEY is set (unless validate-only)
-if [[ "$VALIDATE_ONLY" != "true" ]] && [[ -z "$HUB_ADMIN_KEY" ]]; then
+if [[ "$VALIDATE_ONLY" != "true" ]] && [[ -z "${HUB_ADMIN_KEY:-}" ]]; then
     log_error "HUB_ADMIN_KEY environment variable is required for registration"
     log_info "For validation only, use --validate-only"
     exit 1
@@ -194,8 +191,6 @@ if [[ "$VALIDATE_ONLY" == "true" ]]; then
     log_info "Running in VALIDATE ONLY mode"
 else
     REG_ARGS+=(
-        "--hub-admin-key" "$HUB_ADMIN_KEY"
-        "--output-secrets" "$OUTPUT_DIR"
         "--output-report" "$OUTPUT_DIR/validation-report.json"
         "--output-markdown" "$OUTPUT_DIR/validation-report.md"
         "--verbose"
@@ -225,10 +220,10 @@ if [[ "$VALIDATE_ONLY" != "true" ]] && [[ $REG_EXIT_CODE -eq 0 ]]; then
 
     # Check if registration-results.json exists
     if [[ -f "registration-results.json" ]]; then
-        log_info "API Keys Generated:"
+        log_info "OpenBao key references:"
         echo ""
 
-        # Extract and display API keys
+        # Extract and display references only. Never read or print a key.
         "$PYTHON_CMD" - << 'PYTHON_SCRIPT'
 import json
 import sys
@@ -244,21 +239,18 @@ try:
 
     for agent in agents:
         name = agent.get("name", "unknown")
-        api_key = agent.get("api_key", "")
-        if api_key:
+        api_key_ref = agent.get("api_key_ref", "")
+        if api_key_ref:
             print(f"  Agent: {name}")
-            print(f"  API Key: {api_key}")
+            print(f"  API key reference: {api_key_ref}")
             print()
 
     # Also show summary
     print(f"Total agents registered: {len(agents)}")
     print()
     print("Next steps:")
-    print("1. Secret templates have been created in: $OUTPUT_DIR")
-    print("2. Create SealedSecrets using kubeseal:")
-    print("   kubeseal --format yaml < $OUTPUT_DIR/agent-<name>-secret.template > <sealedsecret-file>.yml")
-    print("3. Apply to cluster:")
-    print("   kubectl apply -f <sealedsecret-file>.yml")
+    print("1. Configure ExternalSecret sync from each OpenBao reference.")
+    print("2. Mount the synced Kubernetes Secret in the agent runner.")
 
 except FileNotFoundError:
     print("No registration results file found")

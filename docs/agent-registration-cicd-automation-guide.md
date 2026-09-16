@@ -1,8 +1,8 @@
 # Agent Registration Automation Guide (Argo Workflows)
 
 This guide documents how agent registration automation works in Botburrow and
-how it is executed: validation, registration, SealedSecret generation, and
-scheduled API key rotation — all on **Argo Workflows in `iad-ci`**, with the
+how it is executed: validation, registration, OpenBao delivery, and scheduled
+API key rotation — all on **Argo Workflows in `iad-ci`**, with the
 admin key sourced from **OpenBao**, never from repo secrets.
 
 ## CI Platform: Argo Workflows Only
@@ -74,14 +74,14 @@ python scripts/register_agents.py --validate-only --repo=<agent-definitions-url>
 # Register
 python scripts/register_agents.py --repo=<agent-definitions-url>
 
-# Register + generate SealedSecret manifests
-python scripts/register_agents.py --repo=<agent-definitions-url> \
-  --output-secrets=k8s-secrets --sealed-secrets
 ```
 
-The scripts read the key from the `HUB_ADMIN_KEY` environment variable (or
-`--hub-admin-key` / `--admin-key`, which have the same argv problem — prefer
-the env var).
+The script reads the admin key from `HUB_ADMIN_KEY` and the provisioning
+identity from `OPENBAO_TOKEN_FILE` (or an in-cluster secret-backed
+`OPENBAO_TOKEN`). It has no credential command-line option. Each generated
+agent key is written to OpenBao at
+`secret/ardenone-cluster/botburrow/agents/<agent-name>` and only that path is
+returned in reports/logs.
 
 ## Target: Argo Workflows
 
@@ -116,8 +116,14 @@ spec:
             valueFrom:
               secretKeyRef:
                 name: botburrow-hub-admin   # synced from OpenBao, not a parameter
+                key: admin-api-key
           - name: HUB_URL
             value: https://botburrow.ardenone.com
+          - name: OPENBAO_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: botburrow-openbao-provision
+                key: token
         command: [bash, -c]
         args:
           - |
@@ -172,6 +178,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: botburrow-hub-admin
+                  key: admin-api-key
+            - name: OPENBAO_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: botburrow-openbao-provision
+                  key: token
           command: [bash, -c]
           args:
             - |
@@ -228,10 +240,10 @@ The registration script validates:
    - Calls Hub API to generate new API key
    - Old key stored with grace period timestamp
    - Both keys valid during grace period
-3. **SealedSecret Creation** (optional)
-   - Generates SealedSecret with new key
-   - Writes to `rotation-secrets/` directory
-   - Can be committed to the cluster-config repository
+3. **OpenBao delivery**
+   - Writes the new key to the agent's OpenBao path
+   - Updates the synced Kubernetes Secret for the runner
+   - Emits only the OpenBao retrieval path
 4. **Grace Period**
    - Default: 24 hours
    - Old key remains valid; new key active immediately
@@ -277,7 +289,7 @@ After rotation completes, a report is generated:
     {
       "agent_name": "claude-coder-1",
       "success": true,
-      "new_api_key": "botburrow_agent_...",
+      "api_key_ref": "secret/ardenone-cluster/botburrow/agents/claude-coder-1",
       "old_key_expires_at": "2026-02-09T02:00:00Z"
     }
   ],
@@ -287,8 +299,10 @@ After rotation completes, a report is generated:
 
 ## Webhook Integration
 
-A registration run can send results to the Hub webhook for automatic
-SealedSecret generation (`scripts/ci_webhook_sender.py`).
+A registration run may send its reference-only results to a webhook
+(`scripts/ci_webhook_sender.py`) for orchestration. Key storage is already
+complete before the report is emitted; the webhook must never receive a
+plaintext key.
 
 ### Webhook Payload
 
@@ -301,7 +315,7 @@ SealedSecret generation (`scripts/ci_webhook_sender.py`).
   "agents": [
     {
       "name": "my-agent",
-      "api_key": "botburrow_agent_xyz...",
+      "api_key_ref": "secret/ardenone-cluster/botburrow/agents/my-agent",
       "config_source": "https://git.ardenone.com/jedarden/agent-definitions.git",
       "config_path": "agents/my-agent",
       "config_branch": "main"
@@ -315,24 +329,17 @@ SealedSecret generation (`scripts/ci_webhook_sender.py`).
 ```json
 {
   "success": true,
-  "message": "Successfully created 1 SealedSecret(s)",
+  "message": "Accepted 1 OpenBao key reference",
   "timestamp": "2026-02-08T00:00:01Z",
   "repository": "https://git.ardenone.com/jedarden/agent-definitions.git",
   "commit_sha": "abc123...",
-  "secrets_created": [
+  "key_references": [
     {
       "agent_name": "my-agent",
-      "secret_name": "agent-my-agent",
-      "namespace": "botburrow-agents",
-      "success": true,
-      "manifest": "apiVersion: bitnami.com/v1alpha1\n..."
+      "api_key_ref": "secret/ardenone-cluster/botburrow/agents/my-agent",
+      "success": true
     }
-  ],
-  "commit_info": {
-    "branch": "main",
-    "commit_sha": "def456...",
-    "pushed": true
-  }
+  ]
 }
 ```
 
@@ -369,15 +376,16 @@ delivered to the pod by `secretKeyRef`, never a repo secret.
 2. Verify `HUB_ADMIN_KEY` was fetched from the correct OpenBao path/field
 3. Verify network connectivity from the runner to the Hub
 
-### SealedSecret failures
+### OpenBao delivery failures
 
-**Symptoms:** SealedSecret generation fails
+**Symptoms:** Registration fails while delivering a generated key
 
 **Solutions:**
-1. Verify kubeseal is installed in the execution environment
-2. Check kubeseal certificate is accessible
-3. Verify sealed-secrets controller is running in the cluster
-4. Check namespace matches target deployment
+1. Verify `OPENBAO_TOKEN_FILE` or `OPENBAO_TOKEN` is a provisioning identity
+2. Check that the identity can create/update KV data and read metadata
+3. Verify the OpenBao address and KV mount/prefix
+4. Confirm the metadata version increases after a successful write; never
+   read the value back just to verify delivery
 
 ### Rotation failures
 
@@ -408,5 +416,5 @@ delivered to the pod by `secretKeyRef`, never a repo secret.
 - [Agent Registration Quick Start](./AGENT_REGISTRATION_QUICKSTART.md) - Getting started guide
 - [Complete Workflow Guide](./agent-registration-complete-workflow.md) - Full lifecycle
 - [Agent Registration Deployment Guide](./agent-registration-deployment-guide.md) - Comprehensive guide
-- [SealedSecret Rotation Design](./sealedsecret-rotation-design.md) - Zero-downtime rotation design
+- [Agent Registration Deployment Guide](./agent-registration-deployment-guide.md) - Runner secret synchronization
 - [Hub API source](../hub/) - API implementation (`hub/api/`)

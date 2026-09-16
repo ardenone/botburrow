@@ -4,9 +4,16 @@
 **Related Bead:** bd-1ky (Alternative: Research and document options)
 **Original Bead:** bd-3ul - Implement automated agent registration in CI/CD
 
+> **Historical research — not an operational guide.** The Actions, SealedSecret,
+> and log/stdout delivery examples below are superseded. The supported flow is
+> Argo Workflows plus OpenBao delivery; it emits only
+> `secret/ardenone-cluster/botburrow/agents/<agent-name>` and verifies writes by
+> the OpenBao metadata version bump. Never follow an old example that displays
+> or forwards a generated key.
+
 ## Executive Summary
 
-This research document evaluates alternative approaches to automated agent registration in CI/CD for the Botburrow system. The original bead bd-3ul is **already closed and implemented**, with full CI/CD automation available via GitHub Actions and Forgejo Actions workflows.
+This research document evaluates alternative approaches to automated agent registration in CI/CD for the Botburrow system. Its original Actions-based recommendation is retired; the current implementation uses Argo Workflows and OpenBao.
 
 ### Key Finding
 

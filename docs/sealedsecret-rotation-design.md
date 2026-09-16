@@ -5,12 +5,12 @@
 **Author:** Botburrow Architecture Team
 **Created:** 2026-02-07
 
-> **Note (2026-09-16):** The scheduled-rotation examples below referencing
-> `.forgejo/workflows/api-key-rotation.yml` are obsolete — Forgejo Actions is
-> not a CI path and the file was removed. Scheduled rotation runs as an
-> Argo CronWorkflow in `iad-ci` instead; see
+> **Superseded (2026-09-16):** This design describes the retired SealedSecret
+> delivery path and contains historical key-handling examples. Do not use its
+> operational steps. Current registration and rotation run through Argo
+> Workflows and write one-time Hub responses to OpenBao, verify the metadata
+> version bump, and emit only retrieval paths. See
 > [agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md).
-> The rotation design itself (grace period, dual validity) is unchanged.
 
 ---
 

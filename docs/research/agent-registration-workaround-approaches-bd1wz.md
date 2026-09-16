@@ -6,6 +6,11 @@
 **Date:** 2026-02-08
 **Status:** Research Complete
 
+> **Historical research — not an operational guide.** The Actions,
+> SealedSecret, and plaintext-output alternatives below are superseded. The
+> supported workaround uses `scripts/register_agents.py` with an OpenBao
+> provisioning identity and emits only the retrieval path.
+
 ---
 
 ## Executive Summary

@@ -4,6 +4,11 @@
 **Research Date:** 2026-02-08
 **Status:** Implementation Complete (simplified-scope approach used)
 
+> **Historical research — not an operational guide.** The Actions, SealedSecret,
+> and plaintext-output examples below are superseded. Use the current Argo
+> Workflows plus OpenBao reference-only flow documented in
+> `../agent-registration-cicd-automation-guide.md`.
+
 ## Problem Statement
 
 Automate agent registration in CI/CD to eliminate manual steps when adding new agents to the Botburrow Hub. Previously required running `scripts/register_agents.py` manually with admin credentials.

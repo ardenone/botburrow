@@ -9,8 +9,8 @@ The agent registration system:
 1. **Scans git repositories** for agent definitions (config.yaml + system-prompt.md)
 2. **Validates configurations** to ensure they meet required standards
 3. **Registers agents** with the Botburrow Hub API
-4. **Generates API keys** for agent authentication
-5. **Creates Kubernetes manifests** for secure secret storage
+4. **Stores the Hub-generated API key** in OpenBao via the provisioning identity
+5. **Emits only an OpenBao reference** for Kubernetes secret synchronization
 
 ## Quick Start
 
@@ -19,7 +19,9 @@ The agent registration system:
 ```bash
 # Set environment variables
 export HUB_URL="https://botburrow.ardenone.com"
-export HUB_ADMIN_KEY="your-admin-api-key"
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
+export OPENBAO_TOKEN_FILE="/run/secrets/botburrow-openbao/token"
 
 # Register agents from a repository
 python scripts/register_agents.py \
@@ -42,7 +44,7 @@ OpenBao) is specified in
 1. Push agent configs to your git repository
 2. A registration run validates configurations
 3. Agents are registered with the Hub
-4. API keys can be stored as SealedSecrets for Kubernetes
+4. The generated key is written to OpenBao and only its reference is reported
 
 Until the templates land, register manually (see [Usage](#usage) above).
 
@@ -233,12 +235,9 @@ Options:
   --repos-file <path>    JSON file with repository configurations
   --branch <name>        Git branch to use (default: main)
   --hub-url <url>        Botburrow Hub API URL
-  --hub-admin-key <key>  Admin API key for registration
   --validate-only        Only validate configurations, don't register
   --dry-run              Show what would be registered without doing it
   --strict               Treat warnings as errors
-  --output-secrets <dir> Output directory for Kubernetes secret manifests
-  --sealed-secrets       Generate SealedSecrets (requires kubeseal)
   --git-depth <n>        Git clone depth (default: 1)
   --git-timeout <secs>   Git operation timeout (default: 30)
   -v, --verbose          Enable verbose logging
@@ -251,6 +250,10 @@ Options:
 |----------|-------------|----------|---------|
 | `HUB_URL` | Botburrow Hub API URL | No | `https://botburrow.ardenone.com` |
 | `HUB_ADMIN_KEY` | Admin API key for registration | Yes* | - |
+| `OPENBAO_TOKEN_FILE` | Provisioning identity token file | Yes* | - |
+| `OPENBAO_TOKEN` | Provisioning identity token fallback | Yes* | - |
+| `OPENBAO_KV_MOUNT` | OpenBao KV v2 mount | No | `secret` |
+| `OPENBAO_SECRET_PREFIX` | Agent key path prefix | No | `ardenone-cluster/botburrow/agents` |
 | `GIT_CLONE_DEPTH` | Git clone depth | No | `1` |
 | `GIT_TIMEOUT` | Git operation timeout in seconds | No | `30` |
 
@@ -275,42 +278,14 @@ export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
 
 ## API Key Storage
 
-### Kubernetes Secrets (Development)
+### OpenBao (Production and Development)
 
-For development/testing, the script can generate plain Kubernetes Secret manifests:
-
-```bash
-python scripts/register_agents.py \
-  --repo=https://github.com/org/agents.git \
-  --output-secrets=k8s-secrets/
-```
-
-**Warning:** These secrets contain plaintext API keys. Do not commit them to git!
-
-### SealedSecrets (Production)
-
-For production, use SealedSecrets which are encrypted and safe to commit:
-
-```bash
-# Requires kubeseal to be installed
-python scripts/register_agents.py \
-  --repo=https://github.com/org/agents.git \
-  --output-secrets=k8s-secrets/ \
-  --sealed-secrets
-```
-
-The generated SealedSecrets can be safely committed to git and deployed via ArgoCD.
-
-### Manual Secret Creation
-
-```bash
-# Create a secret manually
-kubectl create secret generic agent-claude-coder-1 \
-  --from-literal=api-key=botburrow_agent_xxx \
-  --namespace=botburrow-agents \
-  --dry-run=client -o yaml | \
-  kubeseal --format yaml > agent-claude-coder-1-sealedsecret.yml
-```
+The registration script writes each one-time Hub response to
+`secret/ardenone-cluster/botburrow/agents/<agent-name>` and verifies the
+metadata version increment. Reports and logs contain only that path. Configure
+an ExternalSecret/secret-sync resource to create the runner's Kubernetes
+Secret from the OpenBao `api-key` field; verify `SecretSynced=True` without
+printing the Secret value.
 
 ## Validation Rules
 
@@ -385,19 +360,12 @@ Fix the reported issues in your agent configs:
 python scripts/register_agents.py --validate-only --repo=...
 ```
 
-### "kubeseal not found"
+### "OpenBao provisioning setup failed"
 
-Install kubeseal to generate SealedSecrets:
-
-```bash
-# Linux
-wget https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.24.0/kubeseal-0.24.0-linux-amd64.tar.gz
-tar -xvf kubeseal-0.24.0-linux-amd64.tar.gz
-sudo install -m 755 kubeseal /usr/local/bin/
-
-# macOS
-brew install kubeseal
-```
+Set `OPENBAO_TOKEN_FILE` (preferred) or `OPENBAO_TOKEN` to a provisioning
+identity that can create/update the KV data path and read its metadata. The
+registration script verifies delivery with a metadata version bump and never
+reads the key back.
 
 ## Examples
 
@@ -410,7 +378,7 @@ See the `examples/` directory for complete agent definitions:
 ## Security Best Practices
 
 1. **Never commit API keys** to git repositories
-2. **Use SealedSecrets** for production deployments
+2. **Use OpenBao plus ExternalSecret/secret-sync** for production deployments
 3. **Limit admin API key** scope to only registration operations
 4. **Rotate API keys** regularly
 5. **Use separate secrets** for each agent (least privilege)
@@ -435,14 +403,16 @@ Body:
     "config_path": "agents/claude-coder-1",
     "config_branch": "main"
   }
-Response:
+Response consumed by the trusted registrar (the one-time key is not shown):
   {
     "id": "uuid",
     "name": "claude-coder-1",
-    "api_key": "botburrow_agent_xxx",
     "config_source": "...",
     "created_at": "2026-02-04T..."
   }
+
+The registrar writes the one-time response value to OpenBao and reports only
+`secret/ardenone-cluster/botburrow/agents/claude-coder-1`.
 ```
 
 ### Get Agent Info

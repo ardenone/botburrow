@@ -21,7 +21,16 @@ never put it in argv:
 export HUB_URL="https://botburrow.ardenone.com"
 export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
   secret/ardenone-cluster/botburrow/botburrow-hub)"
+
+# Provisioning identity used only to write agent keys and verify metadata.
+# Prefer a mode-600 file or an in-cluster secretKeyRef.
+export OPENBAO_TOKEN_FILE="/run/secrets/botburrow-openbao/token"
 ```
+
+The provisioning identity needs `create`/`update` on
+`secret/data/ardenone-cluster/botburrow/agents/*` and metadata read access on
+`secret/metadata/ardenone-cluster/botburrow/agents/*`; it does not need KV data
+read access. The script verifies every write by a metadata version increment.
 
 ### Step 2: Register
 
@@ -30,8 +39,9 @@ python scripts/register_agents.py \
   --repo="https://git.ardenone.com/jedarden/agent-definitions.git"
 ```
 
-That's it. The script validates every `agents/**/config.yaml`, registers the
-agents, and prints the generated API keys.
+That's it. The Hub generates each key server-side. The script writes the
+one-time response directly to OpenBao using the provisioning identity and
+prints only the retrieval path. It never prints or writes a key.
 
 ## What This Path Covers
 
@@ -39,47 +49,36 @@ agents, and prints the generated API keys.
 |---------|--------|
 | Validate agent configs | ✅ Yes (`--validate-only`) |
 | Register with Hub API | ✅ Yes |
-| Generate API keys | ✅ Yes |
+| Generate and deliver API keys | ✅ Hub generates; script stores in OpenBao |
 | Dry run | ✅ Yes (`--dry-run`) |
-| SealedSecret creation | Manual (below) |
+| Kubernetes delivery | ExternalSecret/secret sync from OpenBao |
 | Scheduled rotation | Manual (below); CronWorkflow target |
 | Push-triggered runs | ❌ Not yet — needs Argo Events in `iad-ci` |
 
-## Manual SealedSecret Creation
+## Deliver the Key to a Runner
 
-After agents are registered, create SealedSecrets for the new API keys:
+For each registered agent, configure the cluster's ExternalSecret/secret-sync
+integration to read the path printed by the script. For example, the default
+reference is:
 
 ```bash
-# 1. Take the API key from registration output
-
-# 2. Create secret template
-cat > agent-<name>-secret.yml.template << EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agent-<name>
-  namespace: botburrow-agents
-type: Opaque
-stringData:
-  api-key: <paste-api-key-here>
-EOF
-
-# 3. Seal the secret
-kubeseal --format yaml < agent-<name>-secret.yml.template > agent-<name>-sealedsecret.yml
-
-# 4. Apply to cluster
-kubectl apply -f agent-<name>-sealedsecret.yml
+# The key value is intentionally never placed in this command or output.
+secret/ardenone-cluster/botburrow/agents/<name>
 ```
 
-Commit only the `*-sealedsecret.yml` — never the template.
+The sync identity may read only the required field (`api-key`). Verify
+delivery by the downstream property (`SecretSynced=True`), never by printing
+the Secret value. Do not create plaintext or SealedSecret templates from the
+registration output.
 
 ## Manual API Key Rotation
 
 ```bash
 export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
   secret/ardenone-cluster/botburrow/botburrow-hub)"
+export OPENBAO_TOKEN_FILE="/run/secrets/botburrow-openbao/token"
 
-python scripts/rotate_agent_keys.py --grace-period=24 --verbose
+python scripts/rotate_agent_keys.py --all --grace-period=24 --verbose
 ```
 
 ## Local Testing
@@ -88,15 +87,16 @@ python scripts/rotate_agent_keys.py --grace-period=24 --verbose
 # Validate only (no registration, no key needed)
 python scripts/register_agents.py --repo "$REPO_URL" --validate-only
 
-# Dry run (shows what would happen)
+# Dry run (shows the OpenBao path that would be used; no key is generated)
 export HUB_URL="https://botburrow.ardenone.com"
 export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
   secret/ardenone-cluster/botburrow/botburrow-hub)"
 python scripts/register_agents.py --repo "$REPO_URL" --dry-run
 ```
 
-Prefer `--dry-run`/`--validate-only` over passing `--hub-admin-key=` on the
-command line — argv values end up in shell history and `ps`.
+The admin key is read from `HUB_ADMIN_KEY`; the registration script has no
+admin-key command-line option. Generated agent keys are never command-line,
+stdout, report, or log values.
 
 ## Troubleshooting
 
@@ -127,7 +127,7 @@ Check the validation report for specific errors:
 ## Moving to Full Automation
 
 The Argo path (WorkflowTemplate for on-demand runs, CronWorkflow for
-rotation, webhook-driven SealedSecret commits) is specified in
+rotation, and reference-only webhook orchestration) is specified in
 [agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md).
 Templates land in `declarative-config/k8s/iad-ci/argo-workflows/` once the
 Hub is deployed.

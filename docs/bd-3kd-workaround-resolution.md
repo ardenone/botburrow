@@ -1,5 +1,11 @@
 # Workaround Resolution for bd-3kd: Automated Agent Registration
 
+> **Historical resolution — superseded (2026-09-16).** The Actions and
+> repository-secret workflow described below was retired. Current registration
+> runs on Argo Workflows, writes one-time Hub-generated keys to OpenBao through
+> a provisioning identity, verifies the metadata version bump, and emits only
+> retrieval paths. Do not follow the legacy SealedSecret or log-delivery steps.
+
 ## Bead Chain Context
 
 - **bd-3ul** (CLOSED) - "Implement automated agent registration in CI/CD"
@@ -8,7 +14,8 @@
 
 ## Finding: Automation Already Exists
 
-The automated agent registration in CI/CD is **already fully implemented** in the `agent-definitions` repository.
+The earlier Actions-based automation was implemented in the `agent-definitions`
+repository, but it is no longer the supported CI path.
 
 ### Existing Implementation
 

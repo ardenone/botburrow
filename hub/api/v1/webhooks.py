@@ -2,7 +2,7 @@
 Webhook endpoints for CI/CD integration and config cache invalidation.
 
 Allows CI/CD workflows to:
-- Deliver agent registration results (including API keys) for SealedSecret creation
+- Receive reference-only agent registration results after OpenBao delivery
 - Invalidate agent config caches when configs change in git
 - Trigger git pulls to refresh agent definitions
 """
@@ -13,10 +13,9 @@ import hmac
 import logging
 import os
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request, Security, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
@@ -96,16 +95,19 @@ async def verify_ci_webhook(request: Request) -> Dict[str, str]:
 
 # Models for agent registration webhook
 class RegisteredAgent(BaseModel):
-    """A single registered agent from CI/CD."""
+    """A single reference-only registration result from CI/CD."""
 
     name: str = Field(..., description="Agent name")
-    api_key: str = Field(..., description="Generated API key")
+    api_key_ref: str = Field(..., description="OpenBao path for the generated key")
     config_source: str = Field(..., description="Git repository URL")
     config_path: str = Field(..., description="Path within repository")
     config_branch: str = Field(default="main", description="Git branch")
     display_name: Optional[str] = Field(None, description="Display name")
     description: Optional[str] = Field(None, description="Agent description")
     type: str = Field(default="native", description="Agent type")
+
+    class Config:
+        extra = "forbid"
 
 
 class AgentRegistrationWebhook(BaseModel):
@@ -125,263 +127,19 @@ class AgentRegistrationWebhook(BaseModel):
             raise ValueError("At least one agent must be registered")
         return v
 
-
-class SealedSecretResult(BaseModel):
-    """Result of SealedSecret generation."""
-
-    agent_name: str
-    secret_name: str
-    namespace: str
-    success: bool
-    error: Optional[str] = None
-    manifest: Optional[str] = None
-    commit_info: Optional[Dict[str, str]] = Field(
-        default=None,
-        description="Git commit info if auto-committed"
-    )
+    class Config:
+        extra = "forbid"
 
 
 class AgentRegistrationResponse(BaseModel):
-    """Response to agent registration webhook."""
+    """Response to a reference-only agent registration webhook."""
 
     success: bool
     message: str
     timestamp: str
     repository: str
     commit_sha: str
-    secrets_created: List[SealedSecretResult]
-    commit_info: Optional[Dict[str, str]] = None
-
-
-async def generate_sealed_secret(
-    api_key: str,
-    agent_name: str,
-    namespace: str = "botburrow-agents",
-    ci_commit_sha: str = "",
-) -> SealedSecretResult:
-    """Generate a SealedSecret for an agent API key.
-
-    This requires kubeseal to be available in the environment.
-    """
-    import subprocess
-    import tempfile
-    from pathlib import Path
-
-    secret_name = f"agent-{agent_name}"
-
-    # Create temporary secret manifest
-    secret_manifest = {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": secret_name,
-            "namespace": namespace,
-            "annotations": {
-                "botburrow.ardenone.com/agent-name": agent_name,
-                "botburrow.ardenone.com/created-at": datetime.now().isoformat(),
-            },
-        },
-        "type": "Opaque",
-        "data": {
-            "api-key": api_key,
-        },
-    }
-
-    try:
-        # Check if kubeseal is available
-        try:
-            subprocess.run(
-                ["kubeseal", "--version"],
-                capture_output=True,
-                check=True,
-                timeout=5,
-            )
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            logger.warning("kubeseal not found, cannot generate SealedSecret")
-            return SealedSecretResult(
-                agent_name=agent_name,
-                secret_name=secret_name,
-                namespace=namespace,
-                success=False,
-                error="kubeseal not available",
-            )
-
-        # Write secret to temporary file
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            yaml.dump(secret_manifest, f)
-            temp_path = f.name
-
-        try:
-            # Seal the secret
-            result = subprocess.run(
-                ["kubeseal", "--format", "yaml", "--cert", "/etc/kubeseal/cert.pem"],
-                input=Path(temp_path).read_text(),
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=10,
-            )
-
-            # Write SealedSecret to manifests directory
-            manifests_dir = Path(settings.sealed_secrets_output_dir)
-            manifests_dir.mkdir(parents=True, exist_ok=True)
-
-            sealed_secret_path = manifests_dir / f"{secret_name}-sealedsecret.yml"
-            sealed_secret_path.write_text(result.stdout)
-
-            # Commit to git if configured
-            commit_info = None
-            if settings.auto_commit_secrets:
-                commit_info = _commit_sealed_secret(
-                    sealed_secret_path,
-                    agent_name,
-                    commit_sha=ci_commit_sha
-                )
-
-            return SealedSecretResult(
-                agent_name=agent_name,
-                secret_name=secret_name,
-                namespace=namespace,
-                success=True,
-                manifest=result.stdout,
-                commit_info=commit_info,
-            )
-
-        finally:
-            # Clean up temp file
-            Path(temp_path).unlink(missing_ok=True)
-
-    except subprocess.TimeoutExpired:
-        return SealedSecretResult(
-            agent_name=agent_name,
-            secret_name=secret_name,
-            namespace=namespace,
-            success=False,
-            error="kubeseal timeout",
-        )
-    except subprocess.CalledProcessError as e:
-        logger.error(f"kubeseal failed: {e.stderr}")
-        return SealedSecretResult(
-            agent_name=agent_name,
-            secret_name=secret_name,
-            namespace=namespace,
-            success=False,
-            error=f"kubeseal failed: {e.stderr[:200]}",
-        )
-    except Exception as e:
-        logger.exception(f"Failed to generate SealedSecret for {agent_name}")
-        return SealedSecretResult(
-            agent_name=agent_name,
-            secret_name=secret_name,
-            namespace=namespace,
-            success=False,
-            error=str(e),
-        )
-
-
-def _commit_sealed_secret(
-    secret_path: Path,
-    agent_name: str,
-    commit_sha: str,
-) -> Optional[Dict[str, str]]:
-    """Commit a SealedSecret to git and push to remote."""
-    import subprocess
-
-    try:
-        # Get git repo info
-        result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        branch = result.stdout.strip() if result.returncode == 0 else "unknown"
-
-        # Get remote URL for info
-        result = subprocess.run(
-            ["git", "config", "--get", "remote.origin.url"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        remote_url = result.stdout.strip() if result.returncode == 0 else "unknown"
-
-        # Add file
-        result = subprocess.run(
-            ["git", "add", str(secret_path)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            logger.warning(f"git add failed: {result.stderr}")
-
-        # Check if there are changes to commit
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            capture_output=True,
-            timeout=5,
-        )
-        # Exit code 1 means there are changes (expected), 0 means no changes
-        if result.returncode == 0:
-            logger.info(f"No changes to commit for {secret_path}")
-            return None
-
-        # Commit
-        commit_message = f"chore: add SealedSecret for agent {agent_name}\n\nAuto-generated from CI/CD registration\n"
-        if commit_sha:
-            commit_message += f"CI commit: {commit_sha}\n"
-
-        result = subprocess.run(
-            ["git", "commit", "-m", commit_message],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        if result.returncode != 0:
-            logger.error(f"git commit failed: {result.stderr}")
-            return None
-
-        # Get new commit SHA
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        new_sha = result.stdout.strip() if result.returncode == 0 else ""
-
-        # Push to remote
-        logger.info(f"Pushing SealedSecret commit to remote: {branch}")
-        push_result = subprocess.run(
-            ["git", "push", "origin", branch],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        push_success = push_result.returncode == 0
-        if not push_success:
-            logger.warning(f"git push failed: {push_result.stderr}")
-            # Still return success since commit was made, push can be retried
-        else:
-            logger.info(f"Successfully pushed SealedSecret to remote: {new_sha[:8]}")
-
-        return {
-            "branch": branch,
-            "commit_sha": new_sha,
-            "file": str(secret_path),
-            "remote_url": remote_url,
-            "pushed": push_success,
-        }
-
-    except subprocess.TimeoutExpired as e:
-        logger.error(f"Git operation timed out: {e}")
-    except Exception as e:
-        logger.error(f"Failed to commit SealedSecret: {e}")
-
-    return None
+    key_references: List[Dict[str, Any]]
 
 
 @router.post(
@@ -396,10 +154,10 @@ async def agent_registration_webhook(
 ) -> AgentRegistrationResponse:
     """Handle agent registration webhook from CI/CD.
 
-    This endpoint receives registration results from CI/CD workflows and:
-    1. Generates SealedSecrets for each agent's API key
-    2. Commits the secrets to the repository (if configured)
-    3. Returns commit information for CI/CD to reference
+    This endpoint receives registration results from CI/CD workflows after the
+    registration job has written each key to OpenBao. It acknowledges the
+    references only; it never accepts, logs, seals, commits, or returns a
+    plaintext API key.
 
     The webhook is secured with HMAC-SHA256 signature verification.
     """
@@ -408,53 +166,22 @@ async def agent_registration_webhook(
         f"({len(webhook_data.agents)} agents)"
     )
 
-    secrets_created = []
-
-    for agent in webhook_data.agents:
-        logger.info(f"Generating SealedSecret for agent: {agent.name}")
-
-        result = await generate_sealed_secret(
-            api_key=agent.api_key,
-            agent_name=agent.name,
-            namespace="botburrow-agents",
-            ci_commit_sha=webhook_data.commit_sha,
-        )
-
-        secrets_created.append(result)
-
-        if result.success:
-            logger.info(f"Created SealedSecret: {result.secret_name}")
-        else:
-            logger.error(f"Failed to create SealedSecret for {agent.name}: {result.error}")
-
-    # Get commit info if any were committed
-    commit_info = None
-    successful_commits = [s.commit_info for s in secrets_created if s.commit_info]
-    if successful_commits:
-        commit_info = {
-            "branch": successful_commits[0].get("branch", ""),
-            "commit_sha": successful_commits[0].get("commit_sha", ""),
+    key_references = [
+        {
+            "agent_name": agent.name,
+            "api_key_ref": agent.api_key_ref,
+            "success": True,
         }
-
-    # Determine overall success
-    all_success = all(s.success for s in secrets_created)
-    failed_count = sum(1 for s in secrets_created if not s.success)
-
-    if all_success:
-        message = f"Successfully created {len(secrets_created)} SealedSecret(s)"
-    elif failed_count == len(secrets_created):
-        message = "Failed to create any SealedSecrets"
-    else:
-        message = f"Created {len(secrets_created) - failed_count}/{len(secrets_created)} SealedSecret(s)"
+        for agent in webhook_data.agents
+    ]
 
     return AgentRegistrationResponse(
-        success=all_success,
-        message=message,
+        success=True,
+        message=f"Accepted {len(key_references)} OpenBao key reference(s)",
         timestamp=datetime.now().isoformat(),
         repository=webhook_data.repository,
         commit_sha=webhook_data.commit_sha,
-        secrets_created=secrets_created,
-        commit_info=commit_info,
+        key_references=key_references,
     )
 
 
@@ -538,15 +265,12 @@ class AgentRotationRequest(BaseModel):
 
 
 class AgentRotationResponse(BaseModel):
-    """Response to agent API key rotation request."""
+    """Reference-only response shape for the retired rotation webhook."""
 
     success: bool
     message: str
     agent_name: str
-    old_api_key: str
-    new_api_key: str
-    sealed_secret_created: bool
-    commit_info: Optional[Dict[str, str]] = None
+    api_key_ref: Optional[str] = None
     timestamp: str
 
 
@@ -560,96 +284,17 @@ async def agent_rotation_webhook(
     request: Request,
     _auth: Depends = Depends(verify_ci_webhook),
 ) -> AgentRotationResponse:
-    """Handle agent API key rotation via webhook.
+    """Reject the retired key-carrying webhook.
 
-    This endpoint allows CI/CD systems to trigger API key rotation for agents:
-    1. Generates a new API key for the agent
-    2. Updates the agent record in the database
-    3. Creates a new SealedSecret with the new key
-    4. Commits the SealedSecret to git (if configured)
-    5. Returns both old and new keys for graceful migration
-
-    The webhook is secured with HMAC-SHA256 signature verification.
-
-    Note: The old API key remains valid until manually deleted, allowing
-    for zero-downtime rotation by updating deployments before removing old keys.
+    Rotation is performed by ``scripts/rotate_agent_keys.py``, which writes
+    the one-time Hub response to OpenBao before emitting its reference. This
+    endpoint remains as an explicit migration response so callers cannot
+    accidentally reintroduce a plaintext-key webhook.
     """
-    from botburrow_hub.db import get_db
-    from botburrow_hub.agents import AgentService
-
-    logger.info(
-        f"Received rotation request for agent: {rotation_request.agent_name} "
-        f"(reason: {rotation_request.reason})"
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Use the OpenBao-backed rotation workflow; this webhook does not handle keys",
     )
-
-    db = get_db()
-    agent_service = AgentService(db)
-
-    try:
-        # Get existing agent
-        agent = await agent_service.get_agent_by_name(rotation_request.agent_name)
-        if not agent:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Agent '{rotation_request.agent_name}' not found"
-            )
-
-        old_api_key = agent.api_key
-
-        # Verify old key hash if provided
-        if rotation_request.old_api_key_hash:
-            import hashlib
-            expected_hash = hashlib.sha256(old_api_key.encode()).hexdigest()
-            if expected_hash != rotation_request.old_api_key_hash:
-                logger.warning(
-                    f"Old API key hash mismatch for {rotation_request.agent_name}. "
-                    "Proceeding with rotation anyway."
-                )
-
-        # Generate new API key
-        new_api_key = agent_service.generate_api_key()
-
-        # Update agent with new API key
-        await agent_service.update_agent_api_key(
-            agent_id=agent.id,
-            new_api_key=new_api_key
-        )
-
-        logger.info(f"Generated new API key for agent: {rotation_request.agent_name}")
-
-        # Generate SealedSecret for new key
-        sealed_result = await generate_sealed_secret(
-            api_key=new_api_key,
-            agent_name=rotation_request.agent_name,
-            namespace="botburrow-agents",
-            ci_commit_sha=rotation_request.commit_sha,
-        )
-
-        # Prepare response
-        response = AgentRotationResponse(
-            success=sealed_result.success,
-            message=f"API key rotated for agent {rotation_request.agent_name}",
-            agent_name=rotation_request.agent_name,
-            old_api_key=old_api_key,
-            new_api_key=new_api_key,
-            sealed_secret_created=sealed_result.success,
-            commit_info=sealed_result.commit_info,
-            timestamp=datetime.now().isoformat(),
-        )
-
-        if not sealed_result.success:
-            response.message += f" (SealedSecret creation failed: {sealed_result.error})"
-
-        return response
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Failed to rotate API key for {rotation_request.agent_name}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"API key rotation failed: {str(e)}"
-        )
 
 
 # ============================================================================

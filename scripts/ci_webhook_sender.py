@@ -2,13 +2,14 @@
 """
 CI/CD Webhook Sender for Agent Registration
 
-This helper script sends agent registration results from CI/CD to the
-Botburrow Hub webhook endpoint for secure API key storage.
+This helper script sends reference-only agent registration results from
+CI/CD to the Botburrow Hub webhook endpoint. API keys are stored in OpenBao
+by the registration job and are never accepted from, parsed from, or sent by
+this helper.
 
 Usage:
     python scripts/ci_webhook_sender.py \\
         --webhook-url=https://botburrow.ardenone.com/api/v1/webhooks/agent-registration \\
-        --webhook-secret=$WEBHOOK_SECRET \\
         --repository=$CI_REPOSITORY_URL \\
         --branch=$CI_BRANCH \\
         --commit-sha=$CI_COMMIT_SHA \\
@@ -75,7 +76,7 @@ def send_webhook(
         repository: Git repository URL
         branch: Git branch name
         commit_sha: Git commit SHA
-        agents: List of registered agents with API keys
+        agents: List of registered agents with OpenBao references
         run_id: CI run/job ID (optional)
         run_url: CI run/job URL (optional)
         timeout: Request timeout in seconds
@@ -83,6 +84,8 @@ def send_webhook(
     Returns:
         Response from webhook endpoint
     """
+    agents = reference_only_agents(agents)
+
     # Prepare webhook payload
     payload = {
         "repository": repository,
@@ -127,75 +130,94 @@ def send_webhook(
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Webhook failed: {e}")
-        if hasattr(e, "response") and e.response is not None:
-            logger.error(f"Response: {e.response.text}")
         raise
 
 
 def load_registration_results(results_file: Path) -> List[Dict[str, Any]]:
     """Load agent registration results from JSON file.
 
-    The file should contain a list of agents with their API keys.
-    Format can vary - this tries multiple common formats.
+    The file must contain a list of agents with ``api_key_ref`` values.
+    Plaintext-key fields are rejected so an old results file cannot leak a
+    credential through this helper.
     """
     with open(results_file) as f:
         data = json.load(f)
 
     # Handle different formats
     if isinstance(data, list):
-        return data
+        agents = data
     elif isinstance(data, dict):
         if "agents" in data:
-            return data["agents"]
+            agents = data["agents"]
         elif "results" in data:
-            return data["results"]
+            agents = data["results"]
         else:
             # Single agent
-            return [data]
+            agents = [data]
     else:
         raise ValueError(f"Unexpected format in {results_file}")
+
+    return reference_only_agents(agents)
+
+
+def reference_only_agents(agents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return safe webhook fields and reject plaintext credential fields."""
+    allowed_fields = {
+        "name",
+        "api_key_ref",
+        "config_source",
+        "config_path",
+        "config_branch",
+        "display_name",
+        "description",
+        "type",
+    }
+    forbidden_fields = {"api_key", "full_api_key", "new_api_key", "old_api_key"}
+    safe_agents = []
+    for index, agent in enumerate(agents):
+        if not isinstance(agent, dict):
+            raise ValueError(f"Agent result {index} is not an object")
+        if forbidden_fields.intersection(agent):
+            raise ValueError(
+                f"Agent result {index} contains a plaintext API-key field; "
+                "use api_key_ref from OpenBao instead"
+            )
+        if not agent.get("api_key_ref"):
+            raise ValueError(
+                f"Agent result {index} has no api_key_ref; refusing to send "
+                "a credential-less or legacy result"
+            )
+        safe_agents.append({key: agent[key] for key in allowed_fields if key in agent})
+    return safe_agents
 
 
 def parse_registration_output(output: str) -> List[Dict[str, Any]]:
     """Parse registration output from register_agents.py.
 
-    Extracts agent names and API keys from script output.
-    This is a fallback when JSON results aren't available.
+    Extracts agent names and OpenBao references from script output.
+    Legacy output containing a plaintext API key is rejected.
     """
+    import re
+
+    if "API Key:" in output or "api_key:" in output:
+        raise ValueError(
+            "Plaintext API-key output is unsupported; use registration-results.json"
+        )
+
     agents = []
-    lines = output.splitlines()
+    current_name = None
+    for line in output.splitlines():
+        name_match = re.search(r"Agent '([^']+)' registered successfully", line)
+        if name_match:
+            current_name = name_match.group(1)
+        ref_match = re.search(r"API key delivered to:\s*(\S+)", line)
+        if ref_match:
+            agents.append({
+                "name": current_name or "",
+                "api_key_ref": ref_match.group(1),
+            })
 
-    # Look for API key patterns in output
-    for i, line in enumerate(lines):
-        if "API Key:" in line or "api_key:" in line:
-            # Extract API key
-            key = line.split(":")[-1].strip()
-
-            # Try to get agent name from previous line (which has 'name' in quotes)
-            if i > 0:
-                prev_line = lines[i - 1]
-                if "'" in prev_line:
-                    parts = prev_line.split("'")
-                    if len(parts) >= 2:
-                        name = parts[1]
-                        if key.startswith("botburrow_agent_"):
-                            agents.append({
-                                "name": name,
-                                "api_key": key,
-                            })
-                            continue
-
-            # Fallback: try to extract from current line if name is present
-            # Format: "API Key: botburrow_agent_xxx (for agent-name)" or similar
-            if key.startswith("botburrow_agent_"):
-                # If we can't find a name, still add the agent with empty name
-                # The caller can fill it in from context
-                agents.append({
-                    "name": "",
-                    "api_key": key,
-                })
-
-    return agents
+    return reference_only_agents(agents) if agents else []
 
 
 def main() -> int:
@@ -208,7 +230,6 @@ Examples:
   # Send registration results from JSON file
   python scripts/ci_webhook_sender.py \\
       --webhook-url=https://botburrow.ardenone.com/api/v1/webhooks/agent-registration \\
-      --webhook-secret=$WEBHOOK_SECRET \\
       --repository=https://github.com/org/agents.git \\
       --branch=main \\
       --commit-sha=abc123 \\
@@ -217,7 +238,6 @@ Examples:
   # Parse from script output
   python scripts/ci_webhook_sender.py \\
       --webhook-url=$WEBHOOK_URL \\
-      --webhook-secret=$WEBHOOK_SECRET \\
       --repository=$CI_REPO_URL \\
       --branch=$CI_BRANCH \\
       --commit-sha=$CI_COMMIT_SHA \\
@@ -237,11 +257,6 @@ Examples:
         "--webhook-url",
         default=os.environ.get("WEBHOOK_URL"),
         help="Botburrow Hub webhook URL",
-    )
-    parser.add_argument(
-        "--webhook-secret",
-        default=os.environ.get("WEBHOOK_SECRET"),
-        help="Shared secret for webhook signature verification",
     )
     parser.add_argument(
         "--repository",
@@ -295,9 +310,10 @@ Examples:
         parser.error(
             "WEBHOOK_URL must be set via --webhook-url or environment variable"
         )
-    if not args.webhook_secret:
+    webhook_secret = os.environ.get("WEBHOOK_SECRET")
+    if not webhook_secret:
         parser.error(
-            "WEBHOOK_SECRET must be set via --webhook-secret or environment variable"
+            "WEBHOOK_SECRET must be set via environment variable"
         )
     if not args.repository:
         parser.error(
@@ -352,7 +368,7 @@ Examples:
     try:
         result = send_webhook(
             webhook_url=args.webhook_url,
-            webhook_secret=args.webhook_secret,
+            webhook_secret=webhook_secret,
             repository=args.repository,
             branch=args.branch,
             commit_sha=args.commit_sha,
@@ -374,12 +390,10 @@ Examples:
             print(f"  Committed to branch: {info.get('branch')}")
             print(f"  New commit: {info.get('commit_sha')}")
 
-        print("\nSecrets Created:")
-        for secret in result.get("secrets_created", []):
-            status = "✓" if secret["success"] else "✗"
-            print(f"  {status} {secret['agent_name']}: {secret['secret_name']}")
-            if not secret["success"]:
-                print(f"      Error: {secret.get('error')}")
+        print("\nOpenBao Key References:")
+        for reference in result.get("key_references", []):
+            status = "✓" if reference["success"] else "✗"
+            print(f"  {status} {reference['agent_name']}: {reference['api_key_ref']}")
 
         print("=" * 60)
 

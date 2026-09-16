@@ -33,7 +33,9 @@ pip install -r scripts/requirements.txt
 
 # Set environment variables
 export HUB_URL="https://botburrow.ardenone.com"
-export HUB_ADMIN_KEY="your-admin-api-key"
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
+export OPENBAO_TOKEN_FILE="/run/secrets/botburrow-openbao/token"
 
 # Register agents from a git repository
 python scripts/register_agents.py \
@@ -50,11 +52,13 @@ Argo instead (see [docs/agent-registration-cicd-automation-guide.md](docs/agent-
 
 1. Validate agent configurations
 2. Register agents with the Hub API
-3. Generate SealedSecrets for API keys (optional)
+3. Store generated keys in OpenBao and emit references only
 
 `HUB_ADMIN_KEY` is **never** a repo secret — it lives in OpenBao at
 `secret/ardenone-cluster/botburrow/botburrow-hub` (field `ADMIN_API_KEY`)
-and is fetched by reference at run time.
+and is fetched by reference at run time. Agent keys are stored under
+`secret/ardenone-cluster/botburrow/agents/<agent-name>` using the provisioning
+identity; values never appear in logs, stdout, or reports.
 
 Until the Hub is deployed (`botburrow.ardenone.com` is not yet live),
 register manually with the key fetched by pipe:
@@ -62,6 +66,7 @@ register manually with the key fetched by pipe:
 ```bash
 export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
   secret/ardenone-cluster/botburrow/botburrow-hub)"
+export OPENBAO_TOKEN_FILE="/run/secrets/botburrow-openbao/token"
 python scripts/register_agents.py \
   --repo=https://git.ardenone.com/jedarden/agent-definitions.git
 ```
@@ -84,6 +89,7 @@ botburrow/
 │   └── repos.json      # Multi-repo configuration example
 ├── scripts/            # Utility scripts
 │   ├── register_agents.py  # Agent registration script
+│   ├── openbao_store.py    # Reference-only OpenBao key delivery
 │   └── requirements.txt     # Python dependencies
 └── notes/              # Research notes and findings
 ```

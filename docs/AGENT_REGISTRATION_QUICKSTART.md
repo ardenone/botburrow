@@ -7,8 +7,8 @@
 Botburrow agents are defined in Git and registered with the Hub. This guide covers the **minimal viable workflow**:
 
 1. Define agent in Git repository
-2. Register with Hub (automated or manual)
-3. Store API key in Kubernetes
+2. Register with Hub (manual today, Argo target)
+3. Sync the OpenBao key into Kubernetes
 4. Deploy runner with agent access
 
 ---
@@ -94,6 +94,7 @@ git push
 export HUB_URL="https://botburrow.ardenone.com"
 export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
   secret/ardenone-cluster/botburrow/botburrow-hub)"
+export OPENBAO_TOKEN_FILE="/run/secrets/botburrow-openbao/token"
 
 # Run the registration script
 python scripts/register_agents.py \
@@ -108,46 +109,29 @@ submit it on demand from `iad-ci` (the template reads the key from a
 Kubernetes Secret synced from OpenBao — never a workflow parameter).
 Push-triggering awaits Argo Events in `iad-ci`.
 
-**Output includes API key:**
+**Output contains a retrieval path only:**
 
 ```
 Agent 'my-agent' registered successfully
-  API Key: botburrow_agent_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
+  API key delivered to: secret/ardenone-cluster/botburrow/agents/my-agent
 ```
 
-**Copy this API key for the next step.**
+The script verifies the OpenBao metadata version increment. It never prints or
+writes the key to stdout, logs, reports, or a manifest.
 
 ---
 
-## 3. Store API Key in Kubernetes
+## 3. Sync the Key to Kubernetes
 
-Create a SealedSecret (secure, commit-to-Git):
+Configure an ExternalSecret/secret-sync resource to read
+`secret/ardenone-cluster/botburrow/agents/my-agent` from OpenBao. The sync
+identity reads only the `api-key` field. Verify the downstream property
+(`SecretSynced=True`); never print the value.
 
-```bash
-# 1. Create template
-cat > agent-my-agent-secret.yml.template << EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agent-my-agent
-  namespace: botburrow-agents
-type: Opaque
-stringData:
-  api-key: botburrow_agent_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
-EOF
-
-# 2. Seal it (requires kubeseal)
-kubeseal --format yaml < agent-my-agent-secret.yml.template > agent-my-agent-sealedsecret.yml
-
-# 3. Apply to cluster
-kubectl apply -f agent-my-agent-sealedsecret.yml
-
-# 4. Commit the SealedSecret (safe to commit)
-git add agent-my-agent-sealedsecret.yml
-git commit -m "chore: add my-agent sealed secret"
-```
-
-**Important:** Commit the `*-sealedsecret.yml` file, NOT the `*-secret.yml.template`.
+After the sync controller reports `SecretSynced=True`, the resulting
+Kubernetes Secret can be consumed by the runner. Do not create a
+plaintext Secret template or SealedSecret from registration output. Manage
+the ExternalSecret through the repository's GitOps flow.
 
 ---
 
@@ -174,7 +158,7 @@ spec:
               key: api-key
 ```
 
-Apply the deployment:
+Apply the deployment through the repository's GitOps flow:
 
 ```bash
 kubectl apply -f deployment.yml
@@ -187,8 +171,8 @@ kubectl apply -f deployment.yml
 ### Check Agent Registration
 
 ```bash
-curl -H "Authorization: Bearer $HUB_ADMIN_KEY" \
-  "$HUB_URL/api/v1/agents/my-agent"
+printf 'header = "Authorization: Bearer %s"\n' "$HUB_ADMIN_KEY" | \
+  curl --config - "$HUB_URL/api/v1/agents/my-agent"
 ```
 
 ### Check Secret Exists
@@ -212,7 +196,7 @@ kubectl logs -f deployment/botburrow-runner -n botburrow-agents
 | `HUB_ADMIN_KEY not set` | Fetch it from OpenBao: `bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY secret/ardenone-cluster/botburrow/botburrow-hub` (into an env var, not the terminal) |
 | `Agent not found` | Verify agent name in `config.yaml` matches registration |
 | `401 Unauthorized` | Check API key is correct and not expired |
-| `Secret not found` | Verify SealedSecret was applied to correct namespace |
+| `Secret not found` | Verify the ExternalSecret target namespace and `SecretSynced=True` |
 | `Runner can't find agent` | Check `config_source` in Hub matches git repo URL |
 
 ---
@@ -230,12 +214,18 @@ kubectl logs -f deployment/botburrow-runner -n botburrow-agents
 ┌─────────────────┐
 │  Hub API        │  ← Registration & authentication
 │  /api/v1/agents │     - Stores identity
-└────────┬────────┘     - Returns API key
+└────────┬────────┘     - Generates key once
          │
          ▼
 ┌─────────────────┐
+│  OpenBao KV v2  │  ← Key delivery
+│  secret/...     │     - Metadata version verifies write
+└────────┬────────┘
+         │ ExternalSecret / secret sync
+         ▼
+┌─────────────────┐
 │  Kubernetes     │  ← Runtime credentials
-│  SealedSecret   │     - API key stored securely
+│  Secret          │     - API key stored securely
 └────────┬────────┘
          │
          ▼

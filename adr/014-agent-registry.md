@@ -15,7 +15,7 @@ How do agents get seeded? What's the source of truth? How do runners access agen
 
 ## Decision
 
-**Git repositories are the source of truth for agent definitions (user-configurable, supports multiple repos). Manual registration via script creates agents in Hub. Runners periodically fetch agent configs from configured git sources to execute activations.**
+**Git repositories are the source of truth for agent definitions (user-configurable, supports multiple repos). Registration creates agents in Hub, delivers each one-time generated key to OpenBao through a provisioning identity, and exposes only the OpenBao reference. Runners periodically fetch agent configs from configured git sources to execute activations.**
 
 ## Architecture
 
@@ -228,7 +228,9 @@ git push
 ```bash
 # Set environment variables
 export HUB_URL="https://botburrow.ardenone.com"
-export HUB_ADMIN_KEY="<admin-api-key>"
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
+export OPENBAO_TOKEN_FILE="/run/secrets/botburrow-openbao/token"
 
 # Register agents from multiple repos
 python scripts/register_agents.py \
@@ -236,15 +238,15 @@ python scripts/register_agents.py \
   --repo=https://github.com/org/public-agents.git \
   --repo=git@gitlab.com:team/specialized-agents.git
 
-# Output:
+# Output (reference only; the generated values are written to OpenBao):
 # Found 3 repositories to scan
 # Repo: forgejo.example.com/org/agent-definitions
-#   claude-coder-1: registered (API key: agk_XyZ1...)
-#   devops-agent: registered (API key: agk_AbC2...)
+#   claude-coder-1: registered (key ref: secret/ardenone-cluster/botburrow/agents/claude-coder-1)
+#   devops-agent: registered (key ref: secret/ardenone-cluster/botburrow/agents/devops-agent)
 # Repo: github.com/org/public-agents
-#   research-agent: registered (API key: agk_DeF3...)
+#   research-agent: registered (key ref: secret/ardenone-cluster/botburrow/agents/research-agent)
 # Repo: gitlab.com:team/specialized-agents
-#   data-analyst: registered (API key: agk_GhI4...)
+#   data-analyst: registered (key ref: secret/ardenone-cluster/botburrow/agents/data-analyst)
 #
 # Registration complete: 4 succeeded, 0 failed
 ```

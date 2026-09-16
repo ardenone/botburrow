@@ -2,18 +2,31 @@
 Tests for agent registration script.
 
 Tests cover:
-- Agent configuration validation
+- Agent configuration validation, driven by on-disk config.yaml /
+  system-prompt.md fixtures covering every documented agent type
+  (docs/agent-registration-guide.md, "Valid Agent Types")
 - Agent config loading from YAML
-- Git repository operations
-- Hub registration API calls
-- Secret manifest generation
+- Git repository scanning (agents/ layout, malformed configs)
+- Multi-repo handling (repos-file parsing, multi-repo validate-only runs
+  against real local git remotes)
+- Hub registration API calls against a stub Hub server (success,
+  already-registered idempotency, auth failure) over real HTTP
+- OpenBao key delivery contract (via a stub key store)
+- OpenBao key delivery and reference-only reports
 - Validation report generation
 """
 
+import contextlib
 import json
+import shutil
+import subprocess
 import tempfile
+import threading
+import uuid
 import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch, MagicMock
 
 import pytest
@@ -31,12 +44,43 @@ from register_agents import (
     ConfigValidator,
     AgentRegistrar,
     RepoConfig,
-    generate_secret_template,
-    generate_sealed_secret,
     load_repos_config,
     get_git_info,
     generate_validation_report,
 )
+from openbao_store import OpenBaoReference
+
+# Directory holding the config.yaml / system-prompt.md fixtures used by the
+# validator, repo-scanning and multi-repo tests below.
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+# The documented agent types (docs/agent-registration-guide.md,
+# "Valid Agent Types"). Kept here as an explicit tripwire: the validator's
+# accepted set and the documentation must not drift apart silently.
+DOCUMENTED_AGENT_TYPES = {
+    "claude-code",
+    "goose",
+    "aider",
+    "opencode",
+    "native",
+    "claude",
+}
+
+
+def load_fixture(category: str, name: str):
+    """Load a fixture's config dict and optional system prompt."""
+    agent_dir = FIXTURES_DIR / category / name
+    config = yaml.safe_load((agent_dir / "config.yaml").read_text())
+    prompt_file = agent_dir / "system-prompt.md"
+    prompt = prompt_file.read_text() if prompt_file.exists() else None
+    return config, prompt
+
+
+def fixture_cases(category: str):
+    """Sorted fixture directory names under the given category."""
+    return sorted(
+        p.name for p in (FIXTURES_DIR / category).iterdir() if p.is_dir()
+    )
 
 
 class TestAgentConfig:
@@ -383,6 +427,27 @@ class TestGitRepository:
         assert prompt2 is None
 
 
+class StubKeyStore:
+    """In-memory stand-in for OpenBaoClient.
+
+    Records delivered keys so tests can assert exactly what was handed
+    to the store without any OpenBao (or secret material) touching disk.
+    """
+
+    def __init__(self):
+        self.delivered = []  # (agent_name, api_key) tuples
+
+    def agent_ref(self, agent_name: str) -> OpenBaoReference:
+        return OpenBaoReference(
+            mount="secret",
+            path=f"ardenone-cluster/botburrow/agents/{agent_name}",
+        )
+
+    def deliver(self, agent_name: str, api_key: str) -> OpenBaoReference:
+        self.delivered.append((agent_name, api_key))
+        return self.agent_ref(agent_name)
+
+
 class TestAgentRegistrar:
     """Test AgentRegistrar class."""
 
@@ -409,9 +474,16 @@ class TestAgentRegistrar:
         mock_response.raise_for_status = Mock()
         mock_session.return_value.post.return_value = mock_response
 
+        key_store = Mock()
+        key_store.deliver.return_value = OpenBaoReference(
+            mount="secret",
+            path="ardenone-cluster/botburrow/agents/test-agent",
+        )
+
         registrar = AgentRegistrar(
             hub_url="https://botburrow.example.com",
             admin_key="admin-key",
+            key_store=key_store,
         )
 
         config = AgentConfig(
@@ -428,7 +500,9 @@ class TestAgentRegistrar:
         )
 
         assert result["name"] == "test-agent"
-        assert "api_key" in result
+        assert result["api_key_ref"] == "secret/ardenone-cluster/botburrow/agents/test-agent"
+        assert "api_key" not in result
+        key_store.deliver.assert_called_once_with("test-agent", "botburrow_agent_abc123")
 
     def test_register_agent_dry_run(self):
         """Test dry run mode doesn't make API calls."""
@@ -447,7 +521,8 @@ class TestAgentRegistrar:
         )
 
         assert result["dry_run"] is True
-        assert "api_key" in result
+        assert result["api_key_ref"] == "secret/ardenone-cluster/botburrow/agents/test-agent"
+        assert "api_key" not in result
 
     @patch('register_agents.AgentRegistrar._get_session')
     def test_register_agent_failure(self, mock_session):
@@ -471,17 +546,6 @@ class TestAgentRegistrar:
                 config_source="https://github.com/test/repo.git",
                 config_path="agents/test-agent",
             )
-
-    def test_generate_api_key(self):
-        """Test API key generation."""
-        registrar = AgentRegistrar(
-            hub_url="https://botburrow.example.com",
-            admin_key="admin-key",
-        )
-
-        api_key = registrar._generate_api_key()
-        assert api_key.startswith("botburrow_agent_")
-        assert len(api_key) > len("botburrow_agent_")
 
     @patch('register_agents.AgentRegistrar._get_session')
     def test_check_hub_connection_success(self, mock_session):
@@ -510,62 +574,6 @@ class TestAgentRegistrar:
         )
 
         assert not registrar.check_hub_connection()
-
-
-class TestSecretGeneration:
-    """Test secret manifest generation functions."""
-
-    def test_generate_secret_template(self):
-        """Test Kubernetes Secret template generation."""
-        api_key = "botburrow_agent_abc123"
-        agent_name = "test-agent"
-
-        secret_yaml = generate_secret_template(api_key, agent_name)
-
-        assert "apiVersion: v1" in secret_yaml
-        assert "kind: Secret" in secret_yaml
-        assert f"name: agent-{agent_name}" in secret_yaml
-        assert "namespace: botburrow-agents" in secret_yaml
-        assert "DO NOT COMMIT THIS FILE TO GIT" in secret_yaml
-        assert "SealedSecrets" in secret_yaml
-
-    def test_generate_secret_template_custom_namespace(self):
-        """Test Secret template with custom namespace."""
-        api_key = "botburrow_agent_abc123"
-        agent_name = "test-agent"
-        namespace = "custom-namespace"
-
-        secret_yaml = generate_secret_template(api_key, agent_name, namespace)
-
-        assert f"namespace: {namespace}" in secret_yaml
-
-    @patch('subprocess.run')
-    def test_generate_sealed_secret_success(self, mock_run):
-        """Test successful SealedSecret generation."""
-        mock_run.return_value = Mock(
-            returncode=0,
-            stdout="apiVersion: bitnami.com/v1alpha1\nkind: SealedSecret..."
-        )
-
-        result = generate_sealed_secret(
-            api_key="botburrow_agent_abc123",
-            agent_name="test-agent",
-        )
-
-        assert result is not None
-        assert "SealedSecret" in result
-
-    @patch('subprocess.run')
-    def test_generate_sealed_secret_kubeseal_not_found(self, mock_run):
-        """Test SealedSecret generation when kubeseal is not installed."""
-        mock_run.side_effect = FileNotFoundError()
-
-        result = generate_sealed_secret(
-            api_key="botburrow_agent_abc123",
-            agent_name="test-agent",
-        )
-
-        assert result is None
 
 
 class TestUtilityFunctions:

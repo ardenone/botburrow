@@ -4,6 +4,13 @@ Agent Registration Script
 
 Registers agents from git repositories to the Botburrow Hub.
 
+The Hub generates each agent's API key server-side and returns it exactly
+once in the registration response, storing only a SHA-256 hash. Keys are
+delivered straight to OpenBao (KV v2) and are never logged, printed, or
+written to result files — output carries only the OpenBao retrieval path.
+If the OpenBao write cannot be verified, registration fails: an
+undelivered key is unrecoverable.
+
 Usage:
     python scripts/register_agents.py --repo=<git-url> [--repo=<git-url> ...]
     python scripts/register_agents.py --repos-file=<path>
@@ -12,17 +19,21 @@ Usage:
 
 Environment Variables:
     HUB_URL: Botburrow Hub API URL (default: https://botburrow.ardenone.com)
-    HUB_ADMIN_KEY: Admin API key for registration (required)
+    HUB_ADMIN_KEY: Admin API key for registration (required to register)
+    OPENBAO_ADDR: OpenBao instance address (default: https://openbao.ardenone.com)
+    OPENBAO_TOKEN_FILE: File holding a provisioning-identity token (preferred)
+    OPENBAO_TOKEN: Provisioning-identity token (fallback for CI secrets)
+    OPENBAO_KV_MOUNT: KV v2 mount (default: secret)
+    OPENBAO_SECRET_PREFIX: Path prefix for agent keys
+                           (default: ardenone-cluster/botburrow/agents)
     GIT_CLONE_DEPTH: Git clone depth (default: 1)
     GIT_TIMEOUT: Git operation timeout in seconds (default: 30)
 """
 
 import argparse
-import hashlib
 import json
 import logging
 import os
-import secrets
 import shutil
 import subprocess
 import sys
@@ -35,6 +46,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
+
+from openbao_store import (
+    DEFAULT_KV_MOUNT,
+    DEFAULT_PATH_PREFIX,
+    OpenBaoClient,
+    OpenBaoDeliveryError,
+    OpenBaoReference,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -544,20 +563,24 @@ class ConfigValidator:
 
 
 class AgentRegistrar:
-    """Register agents with the Botburrow Hub."""
+    """Register agents with the Botburrow Hub.
 
-    API_KEY_PREFIX = "botburrow_agent_"
-    API_KEY_LENGTH = 32
+    On success the Hub returns the agent's API key exactly once (it keeps
+    only a hash). The registrar immediately delivers the key to OpenBao
+    and discards the plaintext; only the OpenBao reference is exposed.
+    """
 
     def __init__(
         self,
         hub_url: str,
         admin_key: str,
         dry_run: bool = False,
+        key_store: Optional[OpenBaoClient] = None,
     ):
         self.hub_url = hub_url.rstrip("/")
         self.admin_key = admin_key
         self.dry_run = dry_run
+        self.key_store = key_store
         self.session = None
 
     def _get_session(self):
@@ -583,9 +606,12 @@ class AgentRegistrar:
         config_source: str,
         config_path: str,
     ) -> Dict[str, Any]:
-        """Register an agent with the Hub.
+        """Register an agent with the Hub and deliver its API key to OpenBao.
 
-        Returns the registration response including the generated API key.
+        Returns a sanitized registration response with an ``api_key_ref``
+        (the OpenBao KV path) added. The Hub's plaintext key is consumed
+        only by the OpenBao write and is never returned, logged, or written
+        to a report.
         """
         # Prepare registration payload
         payload = {
@@ -602,12 +628,15 @@ class AgentRegistrar:
 
         if self.dry_run:
             logger.info(f"[DRY RUN] Would register: {json.dumps(payload, indent=2)}")
-            # Generate a fake API key for dry run
-            api_key = self._generate_api_key()
+            # Show the path the key would be delivered to (no token needed)
+            ref = OpenBaoReference(
+                mount=os.environ.get("OPENBAO_KV_MOUNT", DEFAULT_KV_MOUNT),
+                path=f"{os.environ.get('OPENBAO_SECRET_PREFIX', DEFAULT_PATH_PREFIX)}/{config.name}",
+            )
             return {
                 "name": config.name,
-                "api_key": api_key,
                 "config_source": config_source,
+                "api_key_ref": ref.full_path,
                 "dry_run": True,
             }
 
@@ -618,20 +647,69 @@ class AgentRegistrar:
             response = session.post(url, json=payload, timeout=10)
             response.raise_for_status()
             result = response.json()
-            logger.info(f"Agent '{config.name}' registered successfully")
-            logger.info(f"  API Key: {result.get('api_key', 'N/A')}")
-            return result
+            if not isinstance(result, dict):
+                raise RuntimeError("Hub returned an invalid registration response")
         except Exception as e:
             # Handle both request exceptions and other errors
             logger.error(f"Failed to register agent '{config.name}': {e}")
-            if hasattr(e, "response") and e.response is not None:
-                logger.error(f"  Response: {e.response.text}")
             raise
 
-    def _generate_api_key(self) -> str:
-        """Generate a random API key."""
-        random_bytes = secrets.token_bytes(self.API_KEY_LENGTH)
-        return f"{self.API_KEY_PREFIX}{random_bytes.hex()}"
+        api_key = result.pop("api_key", None)
+        # Keep only the fields the registration report needs. This prevents a
+        # future Hub response extension from accidentally carrying another
+        # credential into a caller's output or report.
+        safe_result_fields = {
+            "id",
+            "name",
+            "display_name",
+            "description",
+            "type",
+            "config_source",
+            "config_path",
+            "config_branch",
+            "api_key_expires_at",
+            "created_at",
+        }
+        safe_result = {
+            key: value for key, value in result.items()
+            if key in safe_result_fields
+        }
+        if api_key == "(unchanged)":
+            # The Hub deliberately cannot return an existing key because it
+            # stores only a hash. Keep the result reference-only and do not
+            # mistake the sentinel for a credential.
+            ref = self.key_store.agent_ref(config.name) if self.key_store else OpenBaoReference(
+                mount=os.environ.get("OPENBAO_KV_MOUNT", DEFAULT_KV_MOUNT),
+                path=f"{os.environ.get('OPENBAO_SECRET_PREFIX', DEFAULT_PATH_PREFIX)}/{config.name}",
+            )
+            safe_result["api_key_ref"] = ref.full_path
+            safe_result["api_key_delivery"] = "unchanged"
+            logger.info(
+                f"Agent '{config.name}' registered successfully; "
+                f"API key unchanged at: {ref.full_path}"
+            )
+            return safe_result
+        if not api_key:
+            raise OpenBaoDeliveryError(
+                f"Hub did not return an API key for '{config.name}'; "
+                "cannot deliver to OpenBao"
+            )
+
+        # The Hub stores only a hash — if this delivery fails, the key is
+        # unrecoverable. Surface the failure instead of dropping the key.
+        if self.key_store is None:
+            raise OpenBaoDeliveryError(
+                "Hub returned an API key but no OpenBao key store is "
+                "configured; refusing to drop an unrecoverable credential. "
+                "Set OPENBAO_TOKEN_FILE (or OPENBAO_TOKEN) with a "
+                "provisioning-identity token."
+            )
+        ref = self.key_store.deliver(config.name, api_key)
+        safe_result["api_key_ref"] = ref.full_path
+
+        logger.info(f"Agent '{config.name}' registered successfully")
+        logger.info(f"  API key delivered to: {ref.full_path} (field: {ref.field})")
+        return safe_result
 
     def check_hub_connection(self) -> bool:
         """Check if Hub is accessible."""
@@ -645,101 +723,6 @@ class AgentRegistrar:
             return response.status_code == 200
         except Exception:
             return False
-
-
-def generate_sealed_secret(
-    api_key: str,
-    agent_name: str,
-    namespace: str = "botburrow-agents",
-) -> str:
-    """Generate a Kubernetes SealedSecret manifest for an API key.
-
-    This requires kubeseal to be installed and configured.
-
-    Args:
-        api_key: The API key to seal
-        agent_name: Name of the agent (used for secret naming)
-        namespace: Kubernetes namespace for the secret
-
-    Returns:
-        YAML manifest for the SealedSecret
-    """
-    # Check if kubeseal is available
-    try:
-        subprocess.run(
-            ["kubeseal", "--version"],
-            capture_output=True,
-            check=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        logger.warning(
-            "kubeseal not found. Skipping SealedSecret generation. "
-            "Install kubeseal to automatically seal secrets."
-        )
-        return None
-
-    # Create temporary secret
-    secret_data = {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": f"agent-{agent_name}",
-            "namespace": namespace,
-        },
-        "type": "Opaque",
-        "data": {
-            "api-key": api_key,
-        },
-    }
-
-    # Use kubeseal to encrypt
-    try:
-        result = subprocess.run(
-            ["kubeseal", "--format", "yaml"],
-            input=json.dumps(secret_data),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return result.stdout
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to generate SealedSecret: {e.stderr}")
-        return None
-
-
-def generate_secret_template(
-    api_key: str,
-    agent_name: str,
-    namespace: str = "botburrow-agents",
-) -> str:
-    """Generate a Kubernetes Secret template for an API key.
-
-    This is for development/testing only. In production, use SealedSecrets.
-
-    Args:
-        api_key: The API key to store
-        agent_name: Name of the agent (used for secret naming)
-        namespace: Kubernetes namespace for the secret
-
-    Returns:
-        YAML manifest for the Secret
-    """
-    import base64
-
-    encoded_key = base64.b64encode(api_key.encode()).decode()
-
-    secret_yaml = f"""# DO NOT COMMIT THIS FILE TO GIT
-# Use SealedSecrets instead: kubeseal < agent-{agent_name}-secret.yml > agent-{agent_name}-sealedsecret.yml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agent-{agent_name}
-  namespace: {namespace}
-type: Opaque
-data:
-  api-key: {encoded_key}
-"""
-    return secret_yaml
 
 
 def load_repos_config(path: str) -> List[RepoConfig]:
@@ -877,10 +860,9 @@ Examples:
   # Dry run (show what would be registered)
   python scripts/register_agents.py --dry-run --repo=https://github.com/org/agents.git
 
-  # Output secrets for Kubernetes
+  # Register and store each generated key in OpenBao; output is reference-only
   python scripts/register_agents.py \\
-    --repo=https://github.com/org/agents.git \\
-    --output-secrets=k8s-secrets/
+    --repo=https://github.com/org/agents.git
 """
     )
 
@@ -916,11 +898,6 @@ Examples:
         help="Botburrow Hub API URL",
     )
     parser.add_argument(
-        "--hub-admin-key",
-        default=os.environ.get("HUB_ADMIN_KEY"),
-        help="Admin API key for registration",
-    )
-    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="Only validate configurations, don't register",
@@ -934,16 +911,6 @@ Examples:
         "--strict",
         action="store_true",
         help="Treat warnings as errors",
-    )
-    parser.add_argument(
-        "--output-secrets",
-        type=Path,
-        help="Output directory for Kubernetes secret manifests",
-    )
-    parser.add_argument(
-        "--sealed-secrets",
-        action="store_true",
-        help="Generate SealedSecrets instead of plain secrets (requires kubeseal)",
     )
     parser.add_argument(
         "--git-depth",
@@ -992,13 +959,15 @@ Examples:
     if not args.repos and not args.repos_file:
         parser.error("Either --repo or --repos-file must be specified")
 
+    hub_admin_key = os.environ.get("HUB_ADMIN_KEY")
+
     if args.validate_only or args.dry_run:
-        if not args.hub_admin_key:
+        if not hub_admin_key:
             logger.info("No HUB_ADMIN_KEY set (ok for --validate-only or --dry-run)")
     else:
-        if not args.hub_admin_key:
+        if not hub_admin_key:
             parser.error(
-                "HUB_ADMIN_KEY must be set via --hub-admin-key or environment variable. "
+                "HUB_ADMIN_KEY must be set via environment variable. "
                 "Set HUB_ADMIN_KEY environment variable with your admin API key."
             )
 
@@ -1035,10 +1004,22 @@ Examples:
     # Create registrar
     registrar = None
     if not args.validate_only:
+        key_store = None
+        if not args.dry_run:
+            try:
+                key_store = OpenBaoClient(
+                    mount=os.environ.get("OPENBAO_KV_MOUNT", DEFAULT_KV_MOUNT),
+                    prefix=os.environ.get("OPENBAO_SECRET_PREFIX", DEFAULT_PATH_PREFIX),
+                )
+            except OpenBaoDeliveryError as e:
+                logger.error("OpenBao provisioning setup failed: %s", e)
+                return 1
+
         registrar = AgentRegistrar(
             hub_url=args.hub_url,
-            admin_key=args.hub_admin_key or "",
+            admin_key=hub_admin_key or "",
             dry_run=args.dry_run,
+            key_store=key_store,
         )
 
         # Check Hub connection
@@ -1123,35 +1104,13 @@ Examples:
                             )
                             succeeded += 1
 
-                            # Store API key in validation data (masked for report)
-                            if "api_key" in result:
-                                api_key = result["api_key"]
-                                agent_data["api_key"] = api_key[:20] + "..." if len(api_key) > 20 else "***"
-                                agent_data["registered"] = True
-
-                                # Store full API key in separate field for webhook
-                                agent_data["full_api_key"] = api_key
-
-                            # Generate secret manifest if requested
-                            if args.output_secrets:
-                                api_key = result.get("api_key", "")
-                                if args.sealed_secrets:
-                                    secret_yaml = generate_sealed_secret(
-                                        api_key,
-                                        agent_name,
-                                    )
-                                else:
-                                    secret_yaml = generate_secret_template(
-                                        api_key,
-                                        agent_name,
-                                    )
-
-                                if secret_yaml:
-                                    output_path = args.output_secrets / f"agent-{agent_name}-secret.yml"
-                                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                                    with open(output_path, "w") as f:
-                                        f.write(secret_yaml)
-                                    logger.info(f"  Secret manifest written to: {output_path}")
+                            # Only persist the OpenBao reference. The Hub's
+                            # plaintext response field was consumed by the
+                            # registrar and is never copied into reports.
+                            agent_data["registered"] = True
+                            agent_data["api_key_ref"] = result["api_key_ref"]
+                            if result.get("api_key_delivery"):
+                                agent_data["api_key_delivery"] = result["api_key_delivery"]
 
                         except Exception as e:
                             logger.error(f"Failed to register agent '{agent_name}': {e}")
@@ -1219,10 +1178,10 @@ Examples:
         # Output JSON results for webhook integration with multi-repo support
         webhook_results = []
         for agent_data in agents_validation_data:
-            if agent_data.get("registered") and "full_api_key" in agent_data:
+            if agent_data.get("registered") and agent_data.get("api_key_ref"):
                 webhook_results.append({
                     "name": agent_data["name"],
-                    "api_key": agent_data["full_api_key"],
+                    "api_key_ref": agent_data["api_key_ref"],
                     "config_source": agent_data.get("config_source", "unknown"),
                     "config_path": agent_data.get("config_path", f"agents/{agent_data['name']}"),
                     "config_branch": agent_data.get("config_branch", "main"),

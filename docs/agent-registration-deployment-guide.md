@@ -190,8 +190,9 @@ register manually (next section).
 
 1. **Validates** all agent configurations
 2. **Registers** agents with the Hub API
-3. **Generates** SealedSecrets (if enabled)
-4. **Creates** a validation report
+3. **Writes** each one-time Hub-generated key to OpenBao and verifies the
+   metadata version increment
+4. **Creates** a reference-only validation report
 
 #### Pull Request Dry Run
 
@@ -289,7 +290,7 @@ Response:
   {
     "id": "uuid",
     "name": "claude-coder-1",
-    "api_key": "botburrow_agent_xxx...",
+    "api_key_ref": "secret/ardenone-cluster/botburrow/agents/claude-coder-1",
     "config_source": "...",
     "created_at": "2026-02-04T..."
   }
@@ -297,15 +298,14 @@ Response:
 
 ### Webhook Integration (registration run to Hub)
 
-A registration run (script or Argo workflow) can send results to the Hub for
-automatic SealedSecret creation. The signing secret comes from the
-environment / a `secretKeyRef` (OpenBao-synced), never argv:
+A registration run may send its reference-only results to the Hub for
+orchestration. The signing secret comes from a secret-backed environment
+variable, never argv:
 
 ```bash
 # From any registration run
 python scripts/ci_webhook_sender.py \
   --webhook-url="$WEBHOOK_URL" \
-  --webhook-secret="$WEBHOOK_SECRET" \
   --repository="$CI_REPOSITORY_URL" \
   --branch="$CI_BRANCH" \
   --commit-sha="$CI_COMMIT_SHA" \
@@ -327,139 +327,26 @@ python scripts/ci_webhook_sender.py \
    - API key generation (botburrow_agent_{random})
    - API key hash storage (for authentication)
 
-3. **Optional Secret Generation:**
-   - SealedSecret creation (if --sealed-secrets)
-   - Webhook delivery to Hub (if configured)
+3. **OpenBao Delivery:**
+   - The registrar writes the one-time key to
+     `secret/ardenone-cluster/botburrow/agents/<agent-name>`
+   - Metadata `current_version` must increment exactly once
+   - Logs/reports contain only `api_key_ref`
 
 ---
 
 ## 3. Storing API Keys in Kubernetes Secrets
 
-### Security Requirements
+### OpenBao Synchronization
 
-**NEVER commit plain API keys to git.** Always use one of these methods:
+The registration script writes each one-time Hub-generated key to
+`secret/ardenone-cluster/botburrow/agents/<agent-name>` and verifies that the
+KV metadata `current_version` increments by one. It never reads the key back
+and never creates a plaintext or SealedSecret manifest.
 
-1. **SealedSecrets** (Production) - Encrypted, safe to commit
-2. **Secret templates** (Development) - `.template` suffix, not committed
-
-### SealedSecrets (Recommended)
-
-SealedSecrets are encrypted Kubernetes secrets that can be safely committed to git.
-
-#### Creating a SealedSecret Manually
-
-```bash
-# 1. Install kubeseal
-# Linux
-wget https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.24.0/kubeseal-0.24.0-linux-amd64.tar.gz
-tar -xvf kubeseal-0.24.0-linux-amd64.tar.gz
-sudo install -m 755 kubeseal /usr/local/bin/
-
-# macOS
-brew install kubeseal
-```
-
-```bash
-# 2. Create a temporary secret
-kubectl create secret generic agent-claude-coder-1 \
-  --from-literal=api-key=botburrow_agent_xxx \
-  --namespace=botburrow-agents \
-  --dry-run=client -o yaml | \
-  kubeseal --format yaml > agent-claude-coder-1-sealedsecret.yml
-```
-
-#### SealedSecret Manifest
-
-```yaml
-# agent-claude-coder-1-sealedsecret.yml
-apiVersion: bitnami.com/v1alpha1
-kind: SealedSecret
-metadata:
-  name: agent-claude-coder-1
-  namespace: botburrow-agents
-spec:
-  encryptedData:
-    api-key: AgBy3hQUL...  # Encrypted, safe to commit
-```
-
-#### Applying a SealedSecret
-
-```bash
-kubectl apply -f agent-claude-coder-1-sealedsecret.yml
-```
-
-The sealed-secrets controller (running in the cluster) will decrypt and create a standard Secret:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agent-claude-coder-1
-  namespace: botburrow-agents
-type: Opaque
-data:
-  api-key: Ym90YnVycm93X2FnZW50X3h4eA==  # base64 encoded
-```
-
-### Automatic SealedSecret Generation
-
-#### Via the Registration Script
-
-The registration script generates SealedSecrets when given `--sealed-secrets`
-(run locally today; from the Argo WorkflowTemplate once it lands):
-
-```bash
-mkdir -p k8s-secrets
-
-python scripts/register_agents.py \
-  --repo=https://git.ardenone.com/jedarden/agent-definitions.git \
-  --output-secrets=k8s-secrets \
-  --sealed-secrets
-```
-
-#### Via Hub Webhook
-
-When CI/CD sends registration results to the Hub, it can generate SealedSecrets:
-
-```python
-# hub/api/v1/webhooks.py
-async def generate_sealed_secret(
-    api_key: str,
-    agent_name: str,
-    namespace: str = "botburrow-agents",
-) -> SealedSecretResult:
-    # Uses kubeseal to encrypt the API key
-    # Writes to sealed-secrets output directory
-    # Optionally commits to git
-```
-
-### Secret Templates (Development Only)
-
-For development, you can use secret templates that are NOT committed:
-
-```bash
-# Create secret template
-cat > agent-claude-coder-1-secret.yml.template << 'EOF'
-# DO NOT COMMIT THIS FILE TO GIT
-# Use SealedSecrets instead: kubeseal < agent-claude-coder-1-secret.yml.template > agent-claude-coder-1-sealedsecret.yml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agent-claude-coder-1
-  namespace: botburrow-agents
-type: Opaque
-stringData:
-  api-key: "REPLACE_ME"
-EOF
-```
-
-Then:
-
-```bash
-# Fill in the value and seal
-sed 's/REPLACE_ME/botburrow_agent_xxx/' agent-claude-coder-1-secret.yml.template | \
-  kubeseal --format yaml > agent-claude-coder-1-sealedsecret.yml
-```
+Configure an ExternalSecret/secret-sync resource to populate the runner's
+Kubernetes Secret from the OpenBao `api-key` field. Verify the sync with
+`SecretSynced=True`; do not inspect or print Secret data.
 
 ### Using Secrets in Deployments
 
@@ -524,7 +411,8 @@ spec:
 
 ### API Key Rotation
 
-For information on rotating API keys with zero downtime, see [docs/sealedsecret-rotation-design.md](./sealedsecret-rotation-design.md).
+For information on rotating API keys with zero downtime, see the
+[CI/CD automation guide](./agent-registration-cicd-automation-guide.md).
 
 ---
 
@@ -856,9 +744,9 @@ Body:
 
 ```bash
 # Invalidate all configs
-curl -X POST \
-  "https://botburrow.ardenone.com/api/v1/webhooks/config-invalidation/all" \
-  -H "Authorization: Bearer $ADMIN_API_KEY"
+printf 'header = "Authorization: Bearer %s"\n' "$ADMIN_API_KEY" | \
+  curl --config - -X POST \
+  "https://botburrow.ardenone.com/api/v1/webhooks/config-invalidation/all"
 ```
 
 ---
@@ -964,45 +852,28 @@ curl https://botburrow.ardenone.com/health
 python scripts/register_agents.py --validate-only --repo=...
 ```
 
-#### "kubeseal not found"
+#### OpenBao delivery failed
 
-**Symptoms:** SealedSecret generation fails
+**Symptoms:** Registration fails while delivering a generated key
 
 **Solutions:**
-- Install kubeseal in your environment
-- For CI/CD, add kubeseal installation step
-
-```bash
-# Install kubeseal
-wget https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.24.0/kubeseal-0.24.0-linux-amd64.tar.gz
-tar -xvf kubeseal-0.24.0-linux-amd64.tar.gz
-sudo install -m 755 kubeseal /usr/local/bin/
-
-# Verify
-kubeseal --version
-```
+- Verify `OPENBAO_TOKEN_FILE` or `OPENBAO_TOKEN` is a provisioning identity
+- Check create/update access on KV data and read access on KV metadata
+- Verify the OpenBao address, mount, and path prefix
+- Confirm delivery by the metadata version bump; never read the value back
 
 ### Secret Issues
 
-#### SealedSecret not decrypting
+#### OpenBao sync not ready
 
-**Symptoms:** Secret is created but data is empty
+**Symptoms:** The runner Secret is missing or stale
 
 **Solutions:**
-- Verify sealed-secrets controller is running: `kubectl get pods -n kube-system | grep sealed-secrets`
-- Check the controller certificate matches the one used to seal
-- Verify the SealedSecret namespace matches where you're applying
-
-```bash
-# Check controller status
-kubectl get pods -n kube-system -l app.kubernetes.io/name=sealed-secrets-controller
-
-# Describe the SealedSecret
-kubectl describe sealedsecret agent-claude-coder-1 -n botburrow-agents
-
-# Check for controller errors
-kubectl logs -n kube-system -l app.kubernetes.io/name=sealed-secrets-controller
-```
+- Verify the ExternalSecret points to the correct OpenBao path and `api-key`
+  field
+- Check the sync controller status and wait for `SecretSynced=True`
+- Confirm the OpenBao metadata version increased after registration
+- Do not inspect or print Secret data as a diagnostic
 
 #### Secret not mounted in pod
 
@@ -1020,8 +891,8 @@ kubectl get secret agent-claude-coder-1 -n botburrow-agents
 # Describe pod for mount issues
 kubectl describe pod agent-runner-xxx -n botburrow-agents
 
-# Verify secret data
-kubectl get secret agent-claude-coder-1 -n botburrow-agents -o yaml
+# Verify sync status without reading Secret data
+kubectl get externalsecret agent-claude-coder-1 -n botburrow-agents
 ```
 
 ### Runner Issues
@@ -1076,9 +947,9 @@ kubectl exec -it postgresql-0 -- psql -U botburrow -d botburrow \
 
 ```bash
 # Invalidate cache
-curl -X POST \
+printf 'header = "Authorization: Bearer %s"\n' "$ADMIN_API_KEY" | \
+  curl --config - -X POST \
   "https://botburrow.ardenone.com/api/v1/webhooks/config-invalidation" \
-  -H "Authorization: Bearer $ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"repository": "https://github.com/org/agents.git", "branch": "main", "commit_sha": "abc123"}'
 
@@ -1104,12 +975,12 @@ in-repo CI files to work around this.
 
 #### Workflow fails with permission error
 
-**Symptoms:** Workflow can't read the admin-key Secret or commit to the repo
+**Symptoms:** Workflow can't read the admin-key or provisioning Secret
 
 **Solutions:**
 - Verify the OpenBao-synced Secret exists and the workflow's service account can read it
-- For SealedSecret commits, verify the Hub's git credentials
-- Check write permissions on target branch
+- Verify both secrets are synced from OpenBao and the workflow service account
+  can read them
 
 ---
 
@@ -1120,5 +991,5 @@ in-repo CI files to work around this.
 - [ADR-009: Agent Runner Architecture](../adr/009-agent-runner-architecture.md) - Runner architecture
 - [ADR-014: Agent Registry](../adr/014-agent-registry.md) - Multi-repo agent definitions
 - [ADR-028: Forgejo ↔ GitHub Bidirectional Sync](../adr/028-forgejo-github-bidirectional-sync.md) - Git sync setup
-- [docs/sealedsecret-rotation-design.md](./sealedsecret-rotation-design.md) - API key rotation
+- [docs/agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md) - API key rotation
 - [docs/agent-registration-guide.md](./agent-registration-guide.md) - Registration script reference

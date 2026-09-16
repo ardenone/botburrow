@@ -3,11 +3,8 @@
 Agent API Key Rotation Script
 
 Rotates API keys for agents with zero downtime using grace period support.
-This script integrates with the Hub API to:
-1. Generate new API keys for agents
-2. Set grace period for old key validity
-3. Generate SealedSecrets for new keys
-4. Provide rotation report for CI/CD
+This script integrates with the Hub API and stores each newly generated key
+in OpenBao. Reports contain only the OpenBao retrieval path.
 
 Usage:
     python scripts/rotate_agent_keys.py --all
@@ -17,6 +14,8 @@ Usage:
 Environment Variables:
     HUB_URL: Botburrow Hub API URL (default: https://botburrow.ardenone.com)
     HUB_ADMIN_KEY: Admin API key for rotation (required)
+    OPENBAO_TOKEN_FILE: Provisioning-identity token file (preferred)
+    OPENBAO_TOKEN: Provisioning-identity token (fallback)
 """
 
 import argparse
@@ -24,10 +23,17 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from openbao_store import (
+    DEFAULT_KV_MOUNT,
+    DEFAULT_PATH_PREFIX,
+    OpenBaoClient,
+    OpenBaoDeliveryError,
+)
 
 try:
     import requests
@@ -49,9 +55,8 @@ class RotationResult:
     agent_name: str
     agent_id: str
     success: bool
-    new_api_key: Optional[str] = None
+    api_key_ref: Optional[str] = None
     old_key_expires_at: Optional[str] = None
-    sealed_secret_path: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -117,12 +122,12 @@ class APIKeyRotator:
         hub_url: str,
         admin_key: str,
         grace_period_hours: int = 24,
-        generate_sealed_secrets: bool = False,
+        key_store: Optional[OpenBaoClient] = None,
     ):
         self.hub_url = hub_url.rstrip("/")
         self.admin_key = admin_key
         self.grace_period_hours = grace_period_hours
-        self.generate_sealed_secrets = generate_sealed_secrets
+        self.key_store = key_store
         self.session = None
 
     def _get_session(self):
@@ -165,10 +170,8 @@ class APIKeyRotator:
     def rotate_agent_key(self, agent_name: str) -> RotationResult:
         """Rotate API key for a specific agent.
 
-        This method:
-        1. Calls the Hub API's /api/v1/agents/me/regenerate-key endpoint
-        2. Stores the old key with grace period
-        3. Returns the new API key
+        The Hub returns the new key once. It is written to OpenBao and only
+        the resulting retrieval path is retained in the rotation result.
 
         Note: The agent must call this endpoint itself using its own API key.
         For admin-initiated rotation, we use the agent's profile endpoint.
@@ -227,105 +230,48 @@ class APIKeyRotator:
             response.raise_for_status()
             data = response.json()
 
-            # Generate SealedSecret if requested
-            sealed_secret_path = None
-            if self.generate_sealed_secrets:
-                sealed_secret_path = self._create_sealed_secret(
-                    agent_name,
-                    data["api_key"]
+            new_api_key = data.get("api_key")
+            if not new_api_key:
+                return RotationResult(
+                    agent_name=agent_name,
+                    agent_id=agent_id,
+                    success=False,
+                    error="Hub did not return a new API key; refusing to continue",
+                )
+            if self.key_store is None:
+                return RotationResult(
+                    agent_name=agent_name,
+                    agent_id=agent_id,
+                    success=False,
+                    error="OpenBao key store is not configured; refusing to drop the new key",
+                )
+
+            try:
+                key_ref = self.key_store.deliver(agent_name, new_api_key)
+            except OpenBaoDeliveryError as e:
+                return RotationResult(
+                    agent_name=agent_name,
+                    agent_id=agent_id,
+                    success=False,
+                    error=str(e),
                 )
 
             return RotationResult(
                 agent_name=agent_name,
                 agent_id=agent_id,
                 success=True,
-                new_api_key=data["api_key"],
+                api_key_ref=key_ref.full_path,
                 old_key_expires_at=data.get("old_key_expires_at", grace_expires_at.isoformat()),
-                sealed_secret_path=sealed_secret_path,
             )
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to rotate key for '{agent_name}': {e}")
-            if hasattr(e, "response") and e.response is not None:
-                error_msg = e.response.text
-            else:
-                error_msg = str(e)
             return RotationResult(
                 agent_name=agent_name,
                 agent_id=agent_id,
                 success=False,
-                error=error_msg
+                error="Hub request failed; see the request status and retry",
             )
-
-    def _create_sealed_secret(self, agent_name: str, api_key: str) -> Optional[str]:
-        """Create a SealedSecret for the rotated API key."""
-        import subprocess
-        import tempfile
-
-        # Check if kubeseal is available
-        try:
-            subprocess.run(
-                ["kubeseal", "--version"],
-                capture_output=True,
-                check=True,
-                timeout=5,
-            )
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            logger.warning("kubeseal not found, skipping SealedSecret generation")
-            return None
-
-        # Create temporary secret manifest
-        secret_manifest = {
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": f"agent-{agent_name}",
-                "namespace": "botburrow-agents",
-                "annotations": {
-                    "botburrow.ardenone.com/key-rotation": datetime.now().isoformat(),
-                    "botburrow.ardenone.com/grace-period": f"{self.grace_period_hours}h",
-                },
-            },
-            "type": "Opaque",
-            "data": {
-                "api-key": api_key,
-            },
-        }
-
-        try:
-            # Write secret to temporary file
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-                json.dump(secret_manifest, f)
-                temp_path = f.name
-
-            # Seal the secret
-            result = subprocess.run(
-                ["kubeseal", "--format", "yaml"],
-                input=json.dumps(secret_manifest),
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=10,
-            )
-
-            # Write to output directory
-            output_dir = Path("rotation-secrets")
-            output_dir.mkdir(exist_ok=True)
-            output_path = output_dir / f"agent-{agent_name}-rotated-{datetime.now().strftime('%Y%m%d')}.yml"
-            output_path.write_text(result.stdout)
-
-            logger.info(f"Created SealedSecret: {output_path}")
-            return str(output_path)
-
-        except subprocess.TimeoutExpired:
-            logger.error(f"kubeseal timeout for {agent_name}")
-            return None
-        except subprocess.CalledProcessError as e:
-            logger.error(f"kubeseal failed for {agent_name}: {e.stderr}")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to create SealedSecret for {agent_name}: {e}")
-            return None
 
 
 def generate_rotation_report(
@@ -374,8 +320,9 @@ Examples:
   # Rotate with 48 hour grace period
   python scripts/rotate_agent_keys.py --all --grace-period 48
 
-  # Generate SealedSecrets for new keys
-  python scripts/rotate_agent_keys.py --all --sealed-secrets
+  # Store newly generated keys in OpenBao and emit references only
+  OPENBAO_TOKEN_FILE=/run/secrets/openbao-token \
+    python scripts/rotate_agent_keys.py --all
 """
     )
 
@@ -394,20 +341,10 @@ Examples:
         help="Botburrow Hub API URL",
     )
     parser.add_argument(
-        "--admin-key",
-        default=os.environ.get("HUB_ADMIN_KEY"),
-        help="Admin API key for rotation",
-    )
-    parser.add_argument(
         "--grace-period",
         type=int,
         default=24,
         help="Grace period in hours for old key validity (default: 24)",
-    )
-    parser.add_argument(
-        "--sealed-secrets",
-        action="store_true",
-        help="Generate SealedSecrets for new API keys",
     )
     parser.add_argument(
         "--output-report",
@@ -433,9 +370,10 @@ Examples:
         logging.getLogger().setLevel(logging.DEBUG)
 
     # Validate required arguments
-    if not args.admin_key:
+    admin_key = os.environ.get("HUB_ADMIN_KEY")
+    if not admin_key:
         parser.error(
-            "HUB_ADMIN_KEY must be set via --admin-key or environment variable. "
+            "HUB_ADMIN_KEY must be set via environment variable. "
             "Set HUB_ADMIN_KEY environment variable with your admin API key."
         )
 
@@ -445,12 +383,21 @@ Examples:
     if args.all and args.agent_name:
         parser.error("Cannot specify both --all and --agent-name")
 
+    try:
+        key_store = OpenBaoClient(
+            mount=os.environ.get("OPENBAO_KV_MOUNT", DEFAULT_KV_MOUNT),
+            prefix=os.environ.get("OPENBAO_SECRET_PREFIX", DEFAULT_PATH_PREFIX),
+        )
+    except OpenBaoDeliveryError as e:
+        logger.error("OpenBao provisioning setup failed: %s", e)
+        return 1
+
     # Create rotator
     rotator = APIKeyRotator(
         hub_url=args.hub_url,
-        admin_key=args.admin_key,
+        admin_key=admin_key,
         grace_period_hours=args.grace_period,
-        generate_sealed_secrets=args.sealed_secrets,
+        key_store=key_store,
     )
 
     # Check Hub connection
@@ -482,9 +429,10 @@ Examples:
         results.append(result)
 
         if result.success:
-            logger.info(f"  ✓ New API key generated (expires: {result.old_key_expires_at})")
-            if result.sealed_secret_path:
-                logger.info(f"  ✓ SealedSecret: {result.sealed_secret_path}")
+            logger.info(
+                f"  ✓ New API key stored at: {result.api_key_ref} "
+                f"(old key expires: {result.old_key_expires_at})"
+            )
         else:
             logger.error(f"  ✗ Failed: {result.error}")
 

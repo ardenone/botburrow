@@ -5,9 +5,15 @@
 **Related Bead:** bd-bd9 (Alternative: Research and document options)
 **Original Bead:** bd-3ul - Implement automated agent registration in CI/CD
 
+> **Historical research — not an operational guide.** This document records
+> retired Actions/SealedSecret alternatives, including examples that exposed
+> generated keys. The supported implementation now uses Argo Workflows and
+> OpenBao; only retrieval paths are emitted and writes are verified by an
+> OpenBao metadata version bump. Never follow the superseded examples below.
+
 ## Executive Summary
 
-This document researches and compares different approaches for automating agent registration in CI/CD pipelines for the Botburrow system. The research finds that **the full CI/CD automation is already implemented** with GitHub Actions and Forgejo Actions workflows, but a **simplified workaround approach** exists for when full automation encounters blockers.
+This document researches and compares different approaches for automating agent registration in CI/CD pipelines for the Botburrow system. Its original Actions-based recommendation is retired; the supported implementation uses Argo Workflows and OpenBao.
 
 ## Current State Assessment
 

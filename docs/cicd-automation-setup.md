@@ -11,7 +11,7 @@ org-wide and Forgejo Actions is not a CI path here; the former
 The automation provides:
 - **Agent config validation** (`scripts/register_agents.py --validate-only`)
 - **Agent registration** against the Hub API
-- **SealedSecret generation** committed to the cluster-config repo via webhook
+- **OpenBao key delivery** with reference-only reports and logs
 - **Zero-downtime API key rotation** (grace period; scheduled via CronWorkflow)
 
 ## Architecture
@@ -28,15 +28,14 @@ The automation provides:
 │  botburrow-agent-registration   │
 │  - Validate agent configs       │
 │  - Call Hub API to register     │
-│  - Send webhook with API keys   │
+│  - Send reference-only result   │
 └────────┬────────────────────────┘
-         │ Webhook
+         │ OpenBao reference
          ▼
 ┌─────────────────────────────────┐
 │  Botburrow Hub                  │
-│  - Generate SealedSecrets       │
-│  - Commit to cluster-config     │
-│  - Push to remote               │
+│  - Generate and hash key        │
+│  - Return key once to registrar │
 └─────────────────────────────────┘
 ```
 
@@ -51,11 +50,11 @@ deployed. Push-triggering additionally requires Argo Events in `iad-ci`
 ## Prerequisites
 
 1. **Botburrow Hub** deployed and accessible (`botburrow.ardenone.com` — not yet live)
-2. **kubeseal** installed and configured in Hub environment
+2. **OpenBao provisioning identity** available to the registration workflow
 3. **Git repository** with agent definitions in `agents/**/config.yaml`
-4. **Write access** to cluster-config repository for SealedSecret commits
-5. **Admin key in OpenBao** at `secret/ardenone-cluster/botburrow/botburrow-hub`
+4. **Admin key in OpenBao** at `secret/ardenone-cluster/botburrow/botburrow-hub`
    (field `ADMIN_API_KEY`)
+5. **OpenBao agent-key prefix** at `secret/ardenone-cluster/botburrow/agents/`
 
 ## Step 1: Secret Sourcing — OpenBao, Not Repo Secrets
 
@@ -66,11 +65,14 @@ secret live in OpenBao and travel by reference:
 # Never print the value; fetch into the environment for one run
 export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
   secret/ardenone-cluster/botburrow/botburrow-hub)"
+export OPENBAO_TOKEN_FILE="/run/secrets/botburrow-openbao/token"
 ```
 
-In-cluster (Argo pods, Hub deployment), the same values are read from a
-Kubernetes Secret synced from OpenBao via `secretKeyRef` — never from a
-workflow parameter and never from repo config.
+In-cluster (Argo pods), the same values are read from Kubernetes Secrets
+synced from OpenBao via `secretKeyRef` — never from a workflow parameter and
+never from repo config. Agent keys are written to
+`secret/ardenone-cluster/botburrow/agents/<agent-name>` by the registration
+script and verified by a metadata version bump.
 
 ### Webhook Secret
 
@@ -89,46 +91,17 @@ Secret; the sender (`scripts/ci_webhook_sender.py`) reads it via
 
 ### Environment Variables
 
-Set these in your Hub deployment (ArgoCD-managed manifest in
-`declarative-config`):
+Set the Hub admin credential in its ArgoCD-managed deployment manifest in
+`declarative-config`. CI registration uses a separate OpenBao provisioning
+identity to store generated agent keys.
 
 ```yaml
 env:
-  - name: BOTBURROW_CI_WEBHOOK_SECRET
+  - name: ADMIN_API_KEY
     valueFrom:
       secretKeyRef:
-        name: botburrow-hub-webhook
-        key: webhook_secret        # synced from OpenBao
-  - name: BOTBURROW_SEALED_SECRETS_OUTPUT_DIR
-    value: /app/k8s/sealed-secrets  # Must be a git repo!
-  - name: BOTBURROW_AUTO_COMMIT_SECRETS
-    value: "true"
-  - name: BOTBURROW_KUBESEAL_CERT_PATH
-    value: /etc/kubeseal/cert.pem
-```
-
-### SealedSecret Git Repository Setup
-
-The Hub needs write access to a git repository for committing SealedSecrets
-(clone of the cluster-config repo, credentials from a mounted secret).
-
-### kubeseal Certificate Mount
-
-Mount the kubeseal certificate in the Hub container:
-
-```yaml
-volumeMounts:
-  - name: kubeseal-cert
-    mountPath: /etc/kubeseal
-    readOnly: true
-
-volumes:
-  - name: kubeseal-cert
-    secret:
-      secretName: kubeseal-cert
-      items:
-        - key: cert.pem
-          path: cert.pem
+        name: botburrow-hub-admin
+        key: admin-api-key        # synced from OpenBao
 ```
 
 ## Step 3: Run a Registration Pass
@@ -181,25 +154,20 @@ curl -X POST https://botburrow.ardenone.com/api/v1/webhooks/ping
 
 ## Step 5: API Key Rotation (Optional)
 
-The webhook supports zero-downtime API key rotation:
+Run the OpenBao-backed rotation script with the same two environment-backed
+identities. It writes each new key before reporting its reference:
 
 ```bash
-curl -X POST \
-  https://botburrow.ardenone.com/api/v1/webhooks/agent-rotation \
-  -H "Content-Type: application/json" \
-  -H "X-Webhook-Signature: sha256=<signature>" \
-  -d '{
-    "agent_name": "my-agent",
-    "reason": "scheduled-rotation",
-    "repository": "https://git.ardenone.com/jedarden/agent-definitions.git",
-    "commit_sha": "abc123"
-  }'
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
+export OPENBAO_TOKEN_FILE="/run/secrets/botburrow-openbao/token"
+python scripts/rotate_agent_keys.py --agent-name my-agent --grace-period 48
 ```
 
-The response includes both old and new API keys for graceful migration:
-1. Deploy new SealedSecret to cluster
-2. Wait for rollout to complete
-3. Remove old API key from Hub
+The rotation response and report include only the new key's OpenBao reference:
+1. Wait for the OpenBao-synced Kubernetes Secret to report `SecretSynced=True`
+2. Wait for the runner rollout to complete
+3. Remove the old key from the Hub after the grace period
 
 Scheduled rotation becomes a `botburrow-api-key-rotation` CronWorkflow in
 `iad-ci` (weekly; see the automation guide for the manifest).
@@ -216,33 +184,28 @@ Scheduled rotation becomes a `botburrow-api-key-rotation` CronWorkflow in
 - Verify the webhook secret in OpenBao matches the Hub's `BOTBURROW_CI_WEBHOOK_SECRET`
 - Check signature generation in `scripts/ci_webhook_sender.py`
 
-### SealedSecret not committed
+### OpenBao key not synchronized
 
-- Check Hub logs for git errors
-- Verify `BOTBURROW_AUTO_COMMIT_SECRETS=true`
-- Ensure Hub has write access to git repository
-- Check git credentials are configured
+- Check the agent's OpenBao reference and metadata version
+- Verify the ExternalSecret/secret-sync reports `SecretSynced=True`
+- Check the sync identity can read only the `api-key` field
+- Never retrieve the value into logs or a shell transcript
 
-### kubeseal fails
-
-- Verify kubeseal is installed: `kubeseal --version`
-- Check certificate is mounted at `/etc/kubeseal/cert.pem`
-- Test kubeseal manually:
-  ```bash
-  echo -n "test" | kubeseal --format=yaml --cert=/etc/kubeseal/cert.pem
-  ```
+The registration path has no kubeseal step. If a runner Secret is missing,
+check the OpenBao reference, metadata version, and `SecretSynced=True` status;
+never use a key value as a diagnostic.
 
 ## Security Best Practices
 
 1. **Never commit** `HUB_ADMIN_KEY` or `WEBHOOK_SECRET` anywhere — OpenBao is their only home
 2. **Never place a secret in argv** — env var or pipe only
 3. **Use different secrets** for development and production
-4. **Rotate secrets** regularly using the rotation webhook
+4. **Rotate keys** regularly using the OpenBao-backed rotation script
 5. **Limit Hub admin key** scope to agent registration only
-6. **Use webhook signature verification** to prevent unauthorized requests
+6. **Use webhook signature verification** for reference-only orchestration
 
 ## Related Documentation
 
 - [Agent Registration Guide](./agent-registration-guide.md)
 - [Automation Guide (Argo Workflows)](./agent-registration-cicd-automation-guide.md)
-- [SealedSecret Rotation Design](./sealedsecret-rotation-design.md)
+- [Agent Registration Deployment Guide](./agent-registration-deployment-guide.md)
