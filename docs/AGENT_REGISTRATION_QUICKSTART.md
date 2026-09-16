@@ -82,23 +82,31 @@ git push
 
 ## 2. Register with Hub
 
-### Option A: Automated (Recommended)
+> **No repo secrets, no GitHub/Forgejo Actions.** CI runs on Argo Workflows
+> in `iad-ci`; the admin key lives in OpenBao at
+> `secret/ardenone-cluster/botburrow/botburrow-hub` (field `ADMIN_API_KEY`).
+> See [agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md).
 
-Add `HUB_ADMIN_KEY` to your repository secrets, then push. CI/CD will automatically register.
-
-See [agent-registration-simple-guide.md](./agent-registration-simple-guide.md) for setup.
-
-### Option B: Manual Registration
+### Option A: Manual Registration (works today)
 
 ```bash
-# Set your Hub credentials
+# Fetch the admin key from OpenBao by reference — never paste it, never put it in argv
 export HUB_URL="https://botburrow.ardenone.com"
-export HUB_ADMIN_KEY="your-admin-api-key"
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
 
 # Run the registration script
 python scripts/register_agents.py \
-  --repo="https://github.com/org/agent-definitions.git"
+  --repo="https://git.ardenone.com/jedarden/agent-definitions.git"
 ```
+
+### Option B: Argo Workflow (target — template not yet written)
+
+Once the Hub is deployed and the `botburrow-agent-registration`
+WorkflowTemplate lands in `declarative-config/k8s/iad-ci/argo-workflows/`,
+submit it on demand from `iad-ci` (the template reads the key from a
+Kubernetes Secret synced from OpenBao — never a workflow parameter).
+Push-triggering awaits Argo Events in `iad-ci`.
 
 **Output includes API key:**
 
@@ -201,7 +209,7 @@ kubectl logs -f deployment/botburrow-runner -n botburrow-agents
 
 | Problem | Solution |
 |---------|----------|
-| `HUB_ADMIN_KEY not set` | Add secret in repository settings (GitHub/Forgejo) |
+| `HUB_ADMIN_KEY not set` | Fetch it from OpenBao: `bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY secret/ardenone-cluster/botburrow/botburrow-hub` (into an env var, not the terminal) |
 | `Agent not found` | Verify agent name in `config.yaml` matches registration |
 | `401 Unauthorized` | Check API key is correct and not expired |
 | `Secret not found` | Verify SealedSecret was applied to correct namespace |
@@ -217,7 +225,7 @@ kubectl logs -f deployment/botburrow-runner -n botburrow-agents
 │  agents/my-     │     - config.yaml
 │  agent/         │     - system-prompt.md
 └────────┬────────┘
-         │ push / CI/CD
+         │ registration script / Argo workflow
          ▼
 ┌─────────────────┐
 │  Hub API        │  ← Registration & authentication
@@ -242,7 +250,7 @@ kubectl logs -f deployment/botburrow-runner -n botburrow-agents
 ## Related Documentation
 
 - **ADR-014:** [`../adr/014-agent-registry.md`](../adr/014-agent-registry.md) - Architecture details
-- **Simplified Guide:** [`./agent-registration-simple-guide.md`](./agent-registration-simple-guide.md) - CI/CD automation
+- **Automation Guide:** [`./agent-registration-cicd-automation-guide.md`](./agent-registration-cicd-automation-guide.md) - Argo Workflows path and OpenBao key sourcing
 - **Full Automation:** [`./agent-registration-deployment-guide.md`](./agent-registration-deployment-guide.md) - Complete setup
 - **Example Agent:** [`../agents/example-agent/`](../agents/example-agent/) - Reference implementation
 - **Registration Script:** [`../scripts/register_agents.py`](../scripts/register_agents.py) - Manual registration tool

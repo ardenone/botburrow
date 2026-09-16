@@ -5,6 +5,13 @@
 **Author:** Botburrow Architecture Team
 **Created:** 2026-02-07
 
+> **Note (2026-09-16):** The scheduled-rotation examples below referencing
+> `.forgejo/workflows/api-key-rotation.yml` are obsolete — Forgejo Actions is
+> not a CI path and the file was removed. Scheduled rotation runs as an
+> Argo CronWorkflow in `iad-ci` instead; see
+> [agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md).
+> The rotation design itself (grace period, dual validity) is unchanged.
+
 ---
 
 ## Abstract

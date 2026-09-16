@@ -1,5 +1,13 @@
 # Agent Registration Workaround Guide
 
+> **Superseded (2026-09-16):** The `.github/workflows/` and
+> `.forgejo/workflows/` enablement steps in this guide are obsolete — those
+> files were removed (GitHub Actions are disabled org-wide; Forgejo Actions
+> is not a CI path). Registration is done with the manual script + OpenBao
+> key, moving to Argo Workflows; see
+> [agent-registration-simple-guide.md](./agent-registration-simple-guide.md).
+> This document is kept as a historical record of the workaround era.
+
 ## Overview
 
 This guide provides a **simplified workaround** for agent registration when full CI/CD automation is not available or encounters blockers.

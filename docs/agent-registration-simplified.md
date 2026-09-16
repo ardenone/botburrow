@@ -1,5 +1,14 @@
 # Simplified Agent Registration (MVP)
 
+> **Superseded (2026-09-16):** The `.github/workflows/` and
+> `.forgejo/workflows/` files referenced below have been removed — GitHub
+> Actions are disabled org-wide and Forgejo Actions is not a CI path. The
+> simplified registration path is now the manual script run with the key
+> from OpenBao; see
+> [agent-registration-simple-guide.md](./agent-registration-simple-guide.md)
+> and [agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md).
+> This document is kept as a historical record of the MVP decision.
+
 ## Overview
 
 This document describes the **minimal viable implementation** of automated agent registration in CI/CD, reducing scope to core functionality while deferring nice-to-have features.

@@ -31,14 +31,20 @@ python scripts/register_agents.py \
   --repo=https://gitlab.com/team/special-agents.git
 ```
 
-### Automated Registration (CI/CD)
+### Automated Registration (Argo Workflows)
 
-The CI/CD workflows (GitHub Actions, Forgejo Actions) automatically register agents when you push to your agent-definitions repository:
+CI runs on **Argo Workflows in `iad-ci`** — GitHub Actions are disabled
+org-wide and there are no in-repo workflow files. The registration
+automation (WorkflowTemplate / CronWorkflow, with the admin key sourced from
+OpenBao) is specified in
+[agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md):
 
 1. Push agent configs to your git repository
-2. The workflow validates configurations
-3. On main/master branch, agents are automatically registered
+2. A registration run validates configurations
+3. Agents are registered with the Hub
 4. API keys can be stored as SealedSecrets for Kubernetes
+
+Until the templates land, register manually (see [Usage](#usage) above).
 
 ## Agent Definition Structure
 
@@ -252,33 +258,20 @@ Options:
 
 ## CI/CD Setup
 
-### GitHub Actions
+There are **no repository secrets and no GitHub/Forgejo Actions workflows** —
+GitHub Actions are disabled org-wide; all CI runs on Argo Workflows in
+`iad-ci`. See
+[agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md)
+for the Argo setup (WorkflowTemplate for on-demand registration runs,
+CronWorkflow for scheduled rotation, Argo Events for push triggering once
+deployed).
 
-1. **Add repository secrets:**
-   - Go to: Settings → Secrets and variables → Actions
-   - Add: `HUB_ADMIN_KEY` with your admin API key
+The admin key is fetched from OpenBao, never committed:
 
-2. **Add repository variables (optional):**
-   - `HUB_URL`: Your Hub URL (default: https://botburrow.ardenone.com)
-   - `GIT_CLONE_DEPTH`: Clone depth (default: 1)
-   - `GENERATE_SEALED_SECRETS`: Set to `true` to generate SealedSecrets
-
-3. **Push your agent definitions:**
-   - The workflow runs automatically on push to main/master
-   - For pull requests, it runs a dry run validation
-
-### Forgejo Actions
-
-1. **Add repository secrets:**
-   - Go to: Repository Settings → Secrets
-   - Add: `HUB_ADMIN_KEY` with your admin API key
-
-2. **Add repository variables (optional):**
-   - Same as GitHub Actions above
-
-3. **Enable the workflow:**
-   - Push the `.forgejo/workflows/agent-registration.yml` file
-   - The workflow runs automatically on push
+```bash
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
+```
 
 ## API Key Storage
 

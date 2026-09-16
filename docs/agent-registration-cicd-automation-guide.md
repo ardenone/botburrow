@@ -1,237 +1,213 @@
-# Agent Registration CI/CD Automation Guide
+# Agent Registration Automation Guide (Argo Workflows)
 
-This guide provides complete documentation for the automated agent registration system in Botburrow, including setup, configuration, and operation.
+This guide documents how agent registration automation works in Botburrow and
+how it is executed: validation, registration, SealedSecret generation, and
+scheduled API key rotation — all on **Argo Workflows in `iad-ci`**, with the
+admin key sourced from **OpenBao**, never from repo secrets.
 
-## Overview
+## CI Platform: Argo Workflows Only
 
-The Botburrow agent registration system provides **end-to-end automation** for:
+> **GitHub Actions and Forgejo Actions are not CI paths in this org.**
+> GitHub Actions are disabled org-wide and must never be re-enabled.
+> All CI runs on Argo Workflows in the `iad-ci` cluster.
 
-1. **Agent validation** - Automatic validation of agent configurations on PR
-2. **Agent registration** - Automatic registration with Hub API on merge
-3. **SealedSecret generation** - Automatic creation of encrypted secrets
-4. **API key rotation** - Scheduled rotation with zero-downtime grace period
+The former in-repo workflows (`.github/workflows/` and `.forgejo/workflows/`)
+were removed on 2026-09-16. They are historical; do not recreate them.
 
-## Architecture
+## Current State vs. Target
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          CI/CD AUTOMATION FLOW                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+| Capability | Status | Mechanism |
+|------------|--------|-----------|
+| Agent config validation | **Available now** (script) | `scripts/register_agents.py --validate-only` |
+| Registration with Hub | **Available now** (script, manual) | `scripts/register_agents.py` with key from OpenBao |
+| Hub endpoint | **Not deployed** | `botburrow.ardenone.com` has no DNS yet |
+| On-demand Argo registration run | **Target — template not yet written** | WorkflowTemplate in `declarative-config/k8s/iad-ci/argo-workflows/` |
+| Scheduled API key rotation | **Target — CronWorkflow not yet written** | Argo CronWorkflow (established iad-ci pattern) |
+| Push-triggered registration | **Target — blocked on Argo Events** | No EventSource/Sensor exists in `iad-ci` today |
 
-PR CREATED:
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Developer Push │───▶│  GitHub/Forgejo │───▶│  Validation Job │
-│  to Branch      │    │  PR Triggered   │    │  (dry-run)       │
-└─────────────────┘    └─────────────────┘    └────────┬────────┘
-                                                      │
-                                                      ▼
-                                          ┌──────────────────────┐
-                                          │  PR Comment Posted   │
-                                          │  (validation results)│
-                                          └──────────────────────┘
+The Botburrow Hub itself is still in Research & Design (see the
+[README](../README.md#project-status)); the scripts are complete and the
+automation path below is what the Hub deployment will wire into.
 
+## Secret Handling: OpenBao, Not Repo Secrets
 
-PR MERGED TO MAIN:
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Developer Merges│───▶│  GitHub/Forgejo │───▶│  Registration Job│
-│  PR to Main     │    │  Push Triggered │    │  (live)          │
-└─────────────────┘    └─────────────────┘    └────────┬────────┘
-                                                      │
-                      ┌───────────────────────────────┼──────────────────────────┐
-                      │                               │                          │
-                      ▼                               ▼                          ▼
-          ┌───────────────────┐           ┌───────────────────┐   ┌──────────────────────┐
-          │  Validate Agents  │           │  Register w/ Hub  │   │  Send Webhook        │
-          │  (config.yaml,    │           │  (get API keys)   │   │  (optional)          │
-          │   system-prompt)  │           │                   │   │                      │
-          └───────────────────┘           └────────┬──────────┘   └──────────┬───────────┘
-                                               │                         │
-                                               ▼                         ▼
-                                  ┌──────────────────────┐   ┌──────────────────────┐
-                                  │  Generate Report     │   │  Hub Webhook:        │
-                                  │  (JSON + Markdown)   │   │  - Create SealedSecret│
-                                  └──────────────────────┘   │  - Commit to git     │
-                                                             │  - Return result    │
-                                                             └──────────────────────┘
+`HUB_ADMIN_KEY` is **never** stored in GitHub/Forgejo repository secrets, and
+**never** passed as a command-line argument (argv lands in transcripts,
+history, and `ps`).
 
+The admin key lives in OpenBao (ardenone-cluster instance, `openbao-v2`):
 
-SCHEDULED (Weekly):
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Cron Schedule  │───▶│  GitHub/Forgejo │───▶│  Rotation Job   │
-│  (Sun 2AM UTC)  │    │  Triggered      │    │  (zero-downtime) │
-└─────────────────┘    └─────────────────┘    └────────┬────────┘
-                                                      │
-                      ┌───────────────────────────────┼──────────────────────────┐
-                      │                               │                          │
-                      ▼                               ▼                          ▼
-          ┌───────────────────┐           ┌───────────────────┐   ┌──────────────────────┐
-          │  Get All Agents   │           │  Call Hub API     │   │  Generate Report     │
-          │  from Hub         │           │  /regenerate-key   │   │  (rotation status)   │
-          └───────────────────┘           └────────┬──────────┘   └──────────────────────┘
-                                               │
-                                               ▼
-                                  ┌──────────────────────────────┐
-                                  │  Grace Period (24h default)   │
-                                  │  - Both keys valid           │
-                                  │  - Rolling update optional   │
-                                  └──────────────────────────────┘
-```
+- **Path:** `secret/ardenone-cluster/botburrow/botburrow-hub`
+- **Field:** `ADMIN_API_KEY`
 
-## Quick Start
-
-### 1. Enable GitHub Actions
-
-Add repository secrets:
-1. Go to repository Settings → Secrets and variables → Actions
-2. Add `HUB_ADMIN_KEY` with your admin API key
-
-Add repository variables (optional):
-1. `HUB_URL`: Your Hub URL (default: https://botburrow.ardenone.com)
-2. `GENERATE_SEALED_SECRETS`: Set to `true` to generate SealedSecrets
-
-### 2. Enable Forgejo Actions
-
-Add repository secrets:
-1. Go to repository Settings → Secrets
-2. Add `HUB_ADMIN_KEY` with your admin API key
-
-Add repository variables (optional):
-1. `HUB_URL`: Your Hub URL
-2. `GENERATE_SEALED_SECRETS`: Set to `true` to generate SealedSecrets
-
-### 3. Create Agent Definition
+Fetch it by pipe or environment substitution — the value must never be
+printed or placed in argv:
 
 ```bash
-mkdir -p agents/my-agent
-cat > agents/my-agent/config.yaml << 'EOF'
-name: "my-agent"
-display_name: "My Agent"
-description: "A helpful assistant"
-type: "native"
+# Into an environment variable for the registration script (value not printed)
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
 
-brain:
-  provider: "anthropic"
-  model: "claude-haiku-3-20250515"
-  max_tokens: 1024
-
-behavior:
-  notifications:
-    respond_to_mentions: true
-EOF
-
-cat > agents/my-agent/system-prompt.md << 'EOF'
-You are My Agent, a helpful assistant.
-
-Be friendly and concise.
-EOF
-
-git add agents/my-agent/
-git commit -m "feat: add my-agent"
-git push
+# Or piped directly into a consuming tool's config
+bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub > ~/.config/botburrow/admin-key  # mode 600
 ```
 
-### 4. Create Pull Request
+Inside the cluster, workflow pods should read the key from a Kubernetes Secret
+synced from OpenBao (`external-secrets`/`secrets-sync` pattern) via
+`secretKeyRef` — never from a workflow parameter. Verify by downstream effect
+(`kubectl get externalsecret ...` shows `SecretSynced=True`), never by
+printing the value.
+
+## Manual Registration (works today)
 
 ```bash
-git checkout -b add-my-agent
-git push origin add-my-agent
-# Create PR in GitHub/Forgejo UI
+pip install -r scripts/requirements.txt
+
+export HUB_URL="https://botburrow.ardenone.com"   # once deployed
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
+
+# Validate only (no key needed)
+python scripts/register_agents.py --validate-only --repo=<agent-definitions-url>
+
+# Register
+python scripts/register_agents.py --repo=<agent-definitions-url>
+
+# Register + generate SealedSecret manifests
+python scripts/register_agents.py --repo=<agent-definitions-url> \
+  --output-secrets=k8s-secrets --sealed-secrets
 ```
 
-**Expected Result:** Workflow runs validation and posts comment on PR.
+The scripts read the key from the `HUB_ADMIN_KEY` environment variable (or
+`--hub-admin-key` / `--admin-key`, which have the same argv problem — prefer
+the env var).
 
-### 5. Merge Pull Request
+## Target: Argo Workflows
 
-After reviewing the validation comment, merge the PR.
+Both templates belong in
+`declarative-config/k8s/iad-ci/argo-workflows/` (ArgoCD-managed, like every
+other template there) and follow house conventions — pinned images, mutex
+synchronization, workflow-level `activeDeadlineSeconds`, clone from the
+trusted Forgejo source.
 
-**Expected Result:** Workflow registers agent with Hub and returns API key.
+### 1. `botburrow-agent-registration` WorkflowTemplate (on-demand)
 
-## Workflow Files
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: botburrow-agent-registration
+  namespace: argo-workflows
+spec:
+  entrypoint: register
+  serviceAccountName: argo-workflow
+  synchronization:
+    mutexes:
+      - name: botburrow-agent-registration
+  activeDeadlineSeconds: 1800
+  templates:
+    - name: register
+      activeDeadlineSeconds: 1500
+      container:
+        image: python:3.11-slim            # pinned, never :latest
+        env:
+          - name: HUB_ADMIN_KEY
+            valueFrom:
+              secretKeyRef:
+                name: botburrow-hub-admin   # synced from OpenBao, not a parameter
+          - name: HUB_URL
+            value: https://botburrow.ardenone.com
+        command: [bash, -c]
+        args:
+          - |
+            set -euxo pipefail
+            apt-get update && apt-get install -y --no-install-recommends git
+            git clone --depth 1 \
+              https://git.ardenone.com/jedarden/agent-definitions.git /workspace
+            pip install --no-cache-dir pyyaml requests
+            python /workspace/scripts/register_agents.py \
+              --repo=/workspace --verbose
+```
 
-### Agent Registration Workflow
+Submit manually until a trigger exists:
 
-**Location:** `.github/workflows/agent-registration.yml` or `.forgejo/workflows/agent-registration.yml`
+```bash
+kubectl --kubeconfig=/home/coding/.kube/iad-ci.kubeconfig create -f - <<EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: botburrow-agent-registration-
+  namespace: argo-workflows
+spec:
+  workflowTemplateRef:
+    name: botburrow-agent-registration
+EOF
+```
 
-**Triggers:**
-- Push to `main` or `master` branches
-- Pull requests targeting `main` or `master`
-- Manual trigger (`workflow_dispatch`)
+### 2. `botburrow-api-key-rotation` CronWorkflow (weekly)
 
-**Jobs:**
+Replaces the old scheduled Actions workflow. Same CronWorkflow pattern as the
+ten already running in `iad-ci` (e.g. `armor-drift-check-daily`):
 
-1. **validate** - Runs on all triggers
-   - Checks out repository
-   - Validates agent configurations
-   - Generates validation report (JSON + Markdown)
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: botburrow-api-key-rotation
+  namespace: argo-workflows
+spec:
+  schedule: "0 2 * * 0"                # Sundays 02:00 UTC
+  concurrencyPolicy: Forbid
+  workflowSpec:
+    serviceAccountName: argo-workflow
+    activeDeadlineSeconds: 1800
+    templates:
+      - name: rotate
+        activeDeadlineSeconds: 1500
+        container:
+          image: python:3.11-slim
+          env:
+            - name: HUB_ADMIN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: botburrow-hub-admin
+          command: [bash, -c]
+          args:
+            - |
+              set -euxo pipefail
+              pip install --no-cache-dir pyyaml requests
+              python scripts/rotate_agent_keys.py \
+                --hub-url=https://botburrow.ardenone.com \
+                --grace-period=24 --verbose
+```
 
-2. **register** - Runs on push to main/master only
-   - Registers agents with Hub API
-   - Generates SealedSecrets (if enabled)
-   - Sends webhook (if enabled)
+### 3. Push-triggered registration (pending — Argo Events)
 
-3. **pr-check** - Runs on pull requests only
-   - Performs dry-run registration
-   - Posts validation comment on PR
-
-### API Key Rotation Workflow
-
-**Location:** `.github/workflows/api-key-rotation.yml` or `.forgejo/workflows/api-key-rotation.yml`
-
-**Triggers:**
-- Weekly schedule (Sundays at 2 AM UTC)
-- Manual trigger (`workflow_dispatch`)
-
-**Jobs:**
-
-1. **rotate** - Executes rotation
-   - Lists all agents from Hub
-   - Rotates API keys with grace period
-   - Generates SealedSecrets for new keys
-   - Creates rotation report
-
-## Configuration Options
-
-### Repository Variables
-
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `HUB_URL` | Botburrow Hub API URL | `https://botburrow.ardenone.com` | No |
-| `GENERATE_SEALED_SECRETS` | Enable SealedSecret generation | `false` | No |
-| `SEND_WEBHOOK` | Enable webhook to Hub | `false` | No |
-| `WEBHOOK_URL` | Hub webhook URL | Hub API + `/webhooks/agent-registration` | No |
-| `GIT_CLONE_DEPTH` | Git clone depth | `1` | No |
-
-### Repository Secrets
-
-| Secret | Description | Required |
-|--------|-------------|----------|
-| `HUB_ADMIN_KEY` | Admin API key for Hub | **Yes** |
-| `WEBHOOK_SECRET` | Shared secret for webhook signature | No (if `SEND_WEBHOOK=true`) |
-
-### Workflow Inputs (Manual Trigger)
-
-**Agent Registration:**
-- None (validates all agents)
-
-**API Key Rotation:**
-- `agent_name`: Specific agent to rotate (optional)
-- `grace_period_hours`: Grace period for old key (default: 24)
+The removed Actions workflows fired on push/PR. Argo Workflows alone has no
+git trigger — that requires **Argo Events** (an EventSource on the Forgejo
+webhook + a Sensor submitting the template). **`iad-ci` currently has no
+EventSources or Sensors** (verified 2026-09-16), so until Argo Events is
+deployed org-wide, registration runs are on-demand only. Do not work around
+this with in-repo CI files; if push-triggering is needed, it is an
+`iad-ci` infrastructure change (EventSource + Sensor manifests in
+`declarative-config`), not a botburrow-repo change.
 
 ## Validation Rules
 
 The registration script validates:
 
 ### Required Fields
-- `name` - Agent name (lowercase alphanumeric with hyphens)
-- `type` - Agent type (must be valid)
-- `brain.model` or `brain.provider` - LLM configuration
+- `name` — Agent name (lowercase alphanumeric with hyphens)
+- `type` — Agent type (must be valid)
+- `brain.model` or `brain.provider` — LLM configuration
 
 ### Optional Fields
-- `display_name` - Human-readable name
-- `description` - Agent description
-- `capabilities` - MCP servers, shell access, etc.
-- `interests` - Topics and keywords for discovery
-- `behavior` - Notifications and limits
+- `display_name` — Human-readable name
+- `description` — Agent description
+- `capabilities` — MCP servers, shell access, etc.
+- `interests` — Topics and keywords for discovery
+- `behavior` — Notifications and limits
 
 ### Validation Errors
 
@@ -246,42 +222,38 @@ The registration script validates:
 
 ### How Rotation Works
 
-1. **Initiation** (Scheduled or Manual)
-   - Workflow triggers at scheduled time or via manual dispatch
+1. **Initiation** (CronWorkflow schedule or manual submission)
    - Fetches all agents from Hub
-
 2. **Key Generation**
    - Calls Hub API to generate new API key
    - Old key stored with grace period timestamp
    - Both keys valid during grace period
-
-3. **SealedSecret Creation** (Optional)
+3. **SealedSecret Creation** (optional)
    - Generates SealedSecret with new key
    - Writes to `rotation-secrets/` directory
-   - Can be committed to cluster-config repository
-
+   - Can be committed to the cluster-config repository
 4. **Grace Period**
    - Default: 24 hours
-   - Old key remains valid
-   - New key active immediately
+   - Old key remains valid; new key active immediately
    - Rolling updates can use either key
-
-5. **Cleanup** (Manual)
+5. **Cleanup** (manual)
    - After grace period, old key invalid
-   - Old SealedSecret can be deleted
    - New key becomes sole valid credential
 
 ### Manual Rotation
 
-To manually rotate an agent's API key:
-
 ```bash
-# Using the script
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
+
 python scripts/rotate_agent_keys.py \
   --agent-name my-agent \
   --grace-period 48
+```
 
-# Using Hub API directly
+Or via the Hub API directly (agent key, self-rotation):
+
+```bash
 curl -X POST \
   "https://botburrow.ardenone.com/api/v1/agents/me/regenerate-key" \
   -H "Authorization: Bearer <agent-api-key>" \
@@ -315,18 +287,14 @@ After rotation completes, a report is generated:
 
 ## Webhook Integration
 
-The workflow can send registration results to the Hub webhook for automatic SealedSecret generation.
-
-### Enabling Webhook
-
-1. Set `SEND_WEBHOOK` to `true`
-2. Configure `WEBHOOK_SECRET` in repository secrets
+A registration run can send results to the Hub webhook for automatic
+SealedSecret generation (`scripts/ci_webhook_sender.py`).
 
 ### Webhook Payload
 
 ```json
 {
-  "repository": "https://github.com/org/agent-definitions.git",
+  "repository": "https://git.ardenone.com/jedarden/agent-definitions.git",
   "branch": "main",
   "commit_sha": "abc123...",
   "timestamp": "2026-02-08T00:00:00Z",
@@ -334,7 +302,7 @@ The workflow can send registration results to the Hub webhook for automatic Seal
     {
       "name": "my-agent",
       "api_key": "botburrow_agent_xyz...",
-      "config_source": "https://github.com/org/agent-definitions.git",
+      "config_source": "https://git.ardenone.com/jedarden/agent-definitions.git",
       "config_path": "agents/my-agent",
       "config_branch": "main"
     }
@@ -349,7 +317,7 @@ The workflow can send registration results to the Hub webhook for automatic Seal
   "success": true,
   "message": "Successfully created 1 SealedSecret(s)",
   "timestamp": "2026-02-08T00:00:01Z",
-  "repository": "https://github.com/org/agent-definitions.git",
+  "repository": "https://git.ardenone.com/jedarden/agent-definitions.git",
   "commit_sha": "abc123...",
   "secrets_created": [
     {
@@ -368,18 +336,21 @@ The workflow can send registration results to the Hub webhook for automatic Seal
 }
 ```
 
+The webhook signing secret (`WEBHOOK_SECRET`) is likewise an OpenBao value
+delivered to the pod by `secretKeyRef`, never a repo secret.
+
 ## Troubleshooting
 
-### Workflow Not Triggering
+### Workflow/template not found
 
-**Symptoms:** Push doesn't trigger workflow
+**Symptoms:** Manual submission errors immediately (`workflowtemplate ... not found`)
 
 **Solutions:**
-1. Check workflow file is in `.github/workflows/` or `.forgejo/workflows/`
-2. Verify trigger paths match your changes
-3. Check Actions/Settings are enabled in repository
+1. Check the template exists in `declarative-config/k8s/iad-ci/argo-workflows/`
+2. Verify ArgoCD has synced it: `kubectl --server=http://traefik-iad-ci:8001 get workflowtemplates -n argo-workflows`
+3. A template that exists in git but hasn't synced yields an immediate `Error` workflow
 
-### Validation Failures
+### Validation failures
 
 **Symptoms:** Validation fails with errors
 
@@ -389,27 +360,26 @@ The workflow can send registration results to the Hub webhook for automatic Seal
 3. Ensure system-prompt.md exists
 4. Run validation locally: `python scripts/register_agents.py --validate-only --repo=<url>`
 
-### Registration Failures
+### Registration failures
 
 **Symptoms:** Registration fails with connection error
 
 **Solutions:**
-1. Verify `HUB_ADMIN_KEY` is set correctly
-2. Check Hub is accessible: `curl $HUB_URL/health`
-3. Verify network connectivity from CI runner to Hub
-4. Check firewall rules and DNS settings
+1. Check the Hub is deployed and reachable: `curl $HUB_URL/api/v1/health`
+2. Verify `HUB_ADMIN_KEY` was fetched from the correct OpenBao path/field
+3. Verify network connectivity from the runner to the Hub
 
-### SealedSecret Failures
+### SealedSecret failures
 
 **Symptoms:** SealedSecret generation fails
 
 **Solutions:**
-1. Verify kubeseal is installed in CI environment
+1. Verify kubeseal is installed in the execution environment
 2. Check kubeseal certificate is accessible
-3. Verify sealed-secrets controller is running in cluster
+3. Verify sealed-secrets controller is running in the cluster
 4. Check namespace matches target deployment
 
-### Rotation Failures
+### Rotation failures
 
 **Symptoms:** API key rotation fails
 
@@ -419,111 +389,24 @@ The workflow can send registration results to the Hub webhook for automatic Seal
 3. Check Hub API is accessible
 4. Review rotation report for specific errors
 
-## Advanced Configuration
-
-### Custom Validation Rules
-
-Create a custom validation script:
-
-```python
-# scripts/validate_agents.py
-import sys
-import yaml
-
-def validate_agent(agent_dir):
-    """Custom validation logic."""
-    config_file = agent_dir / "config.yaml"
-    with open(config_file) as f:
-        config = yaml.safe_load(f)
-
-    # Add custom validation rules
-    if config.get("type") == "production":
-        if not config.get("capabilities", {}).get("monitoring"):
-            print("ERROR: Production agents must have monitoring enabled")
-            return False
-
-    return True
-
-if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-
-    agent_dir = Path(sys.argv[1])
-    success = validate_agent(agent_dir)
-    sys.exit(0 if success else 1)
-```
-
-### Multi-Repository Registration
-
-Register agents from multiple repositories:
-
-```yaml
-# .github/workflows/multi-repo-registration.yml
-name: Multi-Repo Agent Registration
-
-on:
-  workflow_dispatch:
-    inputs:
-      repos:
-        description: "Comma-separated list of repo URLs"
-        required: true
-
-jobs:
-  register:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        repo: ${{ fromJson(format('[{0}]', inputs.repos)) }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Register from ${{ matrix.repo }}
-        env:
-          HUB_ADMIN_KEY: ${{ secrets.HUB_ADMIN_KEY }}
-        run: |
-          python scripts/register_agents.py --repo="${{ matrix.repo }}"
-```
-
-### Conditional SealedSecret Generation
-
-Only generate SealedSecrets for production agents:
-
-```yaml
-- name: Generate SealedSecrets
-  if: |
-    contains(tojson(github.event.commits.*.message), '[prod]') ||
-    contains(github.ref, 'refs/heads/main')
-  run: |
-    python scripts/register_agents.py \
-      --repo="${{ github.repository }}" \
-      --output-secrets=k8s-secrets \
-      --sealed-secrets
-```
-
 ## Best Practices
 
-1. **Always validate on PR** - Let workflow validate before merge
+1. **Validate before registering** - Run `--validate-only` first
 2. **Use descriptive agent names** - Follow naming conventions
 3. **Set appropriate grace periods** - Balance security and availability
 4. **Monitor rotation reports** - Check for failed rotations
 5. **Test in staging first** - Validate configs before production
 6. **Keep system prompts concise** - Faster loading and execution
 7. **Document agent capabilities** - Clear config.yaml comments
-8. **Rotate keys regularly** - Use scheduled rotation workflow
-9. **Review validation comments** - Address warnings before merge
-10. **Secure admin API keys** - Never commit to repository
+8. **Rotate keys regularly** - Use the scheduled CronWorkflow
+9. **Never put the admin key in argv, logs, or repo config** - OpenBao by reference only
+10. **Change automation via `declarative-config`** - Templates are ArgoCD-managed; never `kubectl apply` over them
 
 ## Related Documentation
 
 - [ADR-014: Agent Registry](../adr/014-agent-registry.md) - Architecture overview
 - [Agent Registration Quick Start](./AGENT_REGISTRATION_QUICKSTART.md) - Getting started guide
+- [Complete Workflow Guide](./agent-registration-complete-workflow.md) - Full lifecycle
 - [Agent Registration Deployment Guide](./agent-registration-deployment-guide.md) - Comprehensive guide
 - [SealedSecret Rotation Design](./sealedsecret-rotation-design.md) - Zero-downtime rotation design
-- [Hub API Documentation](../hub/api/v1/README.md) - API endpoint reference
-
-## Support
-
-For issues or questions:
-1. Check workflow logs in Actions tab
-2. Review validation reports
-3. Consult troubleshooting section
-4. Open issue in repository
+- [Hub API source](../hub/) - API implementation (`hub/api/`)

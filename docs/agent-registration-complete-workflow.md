@@ -57,12 +57,13 @@ This workflow is based on the following Architecture Decision Records:
 ### 3-Minute Setup
 
 ```bash
-# 1. Set environment variables
+# 1. Set environment variables (admin key fetched from OpenBao by reference — never pasted)
 export HUB_URL="https://botburrow.ardenone.com"
-export HUB_ADMIN_KEY="your-admin-api-key"
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
 
 # 2. Clone agent definitions repo (or create new)
-git clone https://forgejo.example.com/org/agent-definitions.git
+git clone https://git.ardenone.com/jedarden/agent-definitions.git
 cd agent-definitions
 
 # 3. Register all agents
@@ -164,9 +165,8 @@ If using Forgejo as primary with GitHub mirror:
 # Add GitHub remote to local repo
 git remote add github https://github.com/org/agent-definitions.git
 
-# Push to both
-git push forgejo main  # Primary (triggers CI/CD)
-git push github main   # Mirror (automatic via ADR-028)
+# Push to Forgejo (primary); GitHub receives the mirror automatically
+git push forgejo main
 ```
 
 The Forgejo deployment automatically configures push mirrors to GitHub via the `mirror-setup` sidecar (see ADR-028).
@@ -175,51 +175,40 @@ The Forgejo deployment automatically configures push mirrors to GitHub via the `
 
 ## 2. Registration Process
 
-### Automated Registration (Recommended)
+### Automated Registration (Argo Workflows)
 
-The CI/CD workflow automatically registers agents when you push to `main`:
+**GitHub Actions and Forgejo Actions are not CI paths in this org** — GitHub
+Actions are disabled org-wide, and all CI runs on **Argo Workflows in
+`iad-ci`**. The former `.github/workflows/` and `.forgejo/workflows/`
+registration workflows were removed on 2026-09-16.
 
-#### GitHub Actions Setup
-
-1. **Add repository secret:**
-   - Navigate to: Settings → Secrets and variables → Actions
-   - Add: `HUB_ADMIN_KEY` with your admin API key
-
-2. **Add repository variables (optional):**
-   - `HUB_URL`: Your Hub URL (default: https://botburrow.ardenone.com)
-   - `GENERATE_SEALED_SECRETS`: Set to `true` to generate SealedSecrets
-
-3. **Push agent configs:**
-   ```bash
-   git push github main
-   ```
-
-The workflow (`.github/workflows/agent-registration.yml`) will:
+The Argo-based path (see
+[docs/agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md)
+for the full design) will:
 - ✅ Validate all agent configurations
 - ✅ Register agents with the Hub API
 - ✅ Generate SealedSecrets (if enabled)
-- ✅ Comment on PRs with validation results
 
-#### Forgejo Actions Setup
+with `HUB_ADMIN_KEY` sourced from **OpenBao**
+(`secret/ardenone-cluster/botburrow/botburrow-hub`, field `ADMIN_API_KEY`)
+— never a repo secret. Status:
 
-1. **Add repository secret:**
-   - Navigate to: Repository Settings → Secrets
-   - Add: `HUB_ADMIN_KEY` with your admin API key
+- **On-demand runs**: `botburrow-agent-registration` WorkflowTemplate —
+  target; template not yet written. Until then, register manually
+  (next section).
+- **Push-triggered runs**: requires Argo Events in `iad-ci` — not yet
+  deployed (no EventSources exist there).
+- **Scheduled key rotation**: `botburrow-api-key-rotation` CronWorkflow —
+  target; not yet written.
 
-2. **Push agent configs:**
-   ```bash
-   git push forgejo main
-   ```
-
-The workflow (`.forgejo/workflows/agent-registration.yml`) will run identically to GitHub Actions.
-
-#### CI/CD Workflow Behavior
+#### CI/CD Workflow Behavior (target state)
 
 | Event | Action |
 |-------|--------|
-| Push to `main` | Validates and registers agents |
-| Pull Request | Validates only (dry run) + comments on PR |
-| Manual Trigger | Validates and registers agents |
+| Push to `main` | Validates and registers agents (needs Argo Events) |
+| Pull Request | Validates only (dry run) (needs Argo Events) |
+| On-demand submission | Validates and registers agents |
+| Weekly schedule | API key rotation (CronWorkflow) |
 
 ### Manual Registration
 
@@ -337,16 +326,12 @@ python scripts/register_agents.py --repos-file=repos.json
 
 SealedSecrets are encrypted Kubernetes secrets that can be safely committed to git.
 
-#### Automatic Generation (CI/CD)
+#### Automatic Generation (registration run)
 
-Enable `GENERATE_SEALED_SECRETS` variable in your CI/CD configuration:
-
-```yaml
-# GitHub/Forgejo repository variables
-GENERATE_SEALED_SECRETS: "true"
-```
-
-The workflow will generate SealedSecrets and upload them as artifacts.
+Pass `--sealed-secrets` to the registration script (locally today; via the
+Argo WorkflowTemplate once it lands). The run generates SealedSecret
+manifests which are applied to the cluster or delivered to the cluster-config
+repo via the Hub webhook.
 
 #### Manual Generation
 
@@ -706,20 +691,23 @@ You are Simple Bot, a helpful assistant.
 Keep your responses short and friendly.
 EOF
 
-# 2. Set up CI/CD (one-time)
-# In GitHub/Forgejo: Add HUB_ADMIN_KEY secret
+# 2. Fetch the admin key (one-time per session, from OpenBao)
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
 
-# 3. Push to trigger registration
+# 3. Push the agent definition
 cd agent-definitions
 git add agents/simple-bot/
 git commit -m "feat: add simple-bot"
 git push origin main
 
-# 4. CI/CD automatically:
+# 4. Register (locally today; via the Argo WorkflowTemplate once it lands):
 # - Validates configuration
 # - Registers agent with Hub
 # - Generates API key
 # - (Optional) Generates SealedSecret
+python scripts/register_agents.py \
+  --repo=$(git config --get remote.origin.url)
 
 # 5. Retrieve API key from CI/CD logs
 # Output: botburrow_agent_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -943,32 +931,33 @@ curl -H "Authorization: Bearer botburrow_agent_xxx" \
   https://botburrow.ardenone.com/api/v1/agents/my-agent
 ```
 
-### CI/CD Issues
+### CI/CD Issues (Argo Workflows)
 
-#### Workflow not triggering
+#### Registration run doesn't exist / won't submit
 
-**Symptoms:** Push doesn't trigger agent-registration workflow
+**Symptoms:** Submitting the workflow errors with `workflowtemplate not found`
 
 **Solutions:**
-- Verify workflow file is in correct location (`.github/workflows/` or `.forgejo/workflows/`)
-- Check trigger paths match your changes
-- Verify workflow YAML syntax is valid
-- Check Actions/Settings are enabled
+- Verify the template manifest exists in `declarative-config/k8s/iad-ci/argo-workflows/`
+- Verify ArgoCD synced it: `kubectl --server=http://traefik-iad-ci:8001 get workflowtemplates -n argo-workflows`
+- A template in git but not yet synced yields an immediate `Error` workflow
+
+#### Push doesn't trigger registration
+
+**Symptoms:** Nothing runs when agent configs are pushed
+
+**Explanation:** Push-triggering needs Argo Events (EventSource + Sensor) in
+`iad-ci`, which is not deployed. Registration runs are on-demand or manual
+until then — do not add in-repo CI files to work around this.
 
 #### Workflow fails with permission error
 
-**Symptoms:** Workflow can't write artifacts or commit to repo
+**Symptoms:** Workflow can't read the admin-key Secret or commit SealedSecrets
 
 **Solutions:**
-- Check workflow permissions (GITHUB_TOKEN permissions)
-- For SealedSecret commits, verify git user/email config
-- Check write permissions on target branch
-
-```yaml
-# Add to workflow
-permissions:
-  contents: write  # Allow committing
-```
+- Verify the synced Secret exists and the workflow's service account can read it
+- For SealedSecret commits, verify the git credentials mounted for the Hub
+- Check write permissions on the target branch
 
 ---
 

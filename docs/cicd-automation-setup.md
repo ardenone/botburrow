@@ -1,15 +1,18 @@
-# CI/CD Automation Setup for Agent Registration
+# CI/CD Automation Setup for Agent Registration (Argo Workflows)
 
-This guide covers setting up fully automated agent registration using GitHub Actions or Forgejo Actions with the Botburrow Hub.
+This guide covers setting up automated agent registration for the Botburrow
+Hub. **CI runs on Argo Workflows in `iad-ci`** — GitHub Actions are disabled
+org-wide and Forgejo Actions is not a CI path here; the former
+`.github/workflows/` and `.forgejo/workflows/` files were removed on
+2026-09-16 and must not be recreated.
 
 ## Overview
 
-The CI/CD automation provides:
-- **Automatic agent validation** on every push and PR
-- **Automatic agent registration** when merging to main branch
-- **Automatic SealedSecret generation** committed to cluster-config repo
-- **PR validation with status checks** and dry-run reports
-- **Zero-downtime API key rotation** via webhook
+The automation provides:
+- **Agent config validation** (`scripts/register_agents.py --validate-only`)
+- **Agent registration** against the Hub API
+- **SealedSecret generation** committed to the cluster-config repo via webhook
+- **Zero-downtime API key rotation** (grace period; scheduled via CronWorkflow)
 
 ## Architecture
 
@@ -18,10 +21,11 @@ The CI/CD automation provides:
 │  Git Repository │
 │  (agents/**)    │
 └────────┬────────┘
-         │ Push/PR
+         │ registration run
          ▼
 ┌─────────────────────────────────┐
-│  GitHub/Forgejo Actions         │
+│  Argo Workflows (iad-ci)        │
+│  botburrow-agent-registration   │
 │  - Validate agent configs       │
 │  - Call Hub API to register     │
 │  - Send webhook with API keys   │
@@ -36,60 +40,65 @@ The CI/CD automation provides:
 └─────────────────────────────────┘
 ```
 
+Today this runs **manually** (the scripts from any checkout, key from
+OpenBao). The Argo WorkflowTemplate / CronWorkflow that replace the removed
+Actions workflows are described in
+[agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md)
+and land in `declarative-config/k8s/iad-ci/argo-workflows/` when the Hub is
+deployed. Push-triggering additionally requires Argo Events in `iad-ci`
+(not yet deployed — no EventSources exist there).
+
 ## Prerequisites
 
-1. **Botburrow Hub** deployed and accessible
+1. **Botburrow Hub** deployed and accessible (`botburrow.ardenone.com` — not yet live)
 2. **kubeseal** installed and configured in Hub environment
 3. **Git repository** with agent definitions in `agents/**/config.yaml`
 4. **Write access** to cluster-config repository for SealedSecret commits
+5. **Admin key in OpenBao** at `secret/ardenone-cluster/botburrow/botburrow-hub`
+   (field `ADMIN_API_KEY`)
 
-## Step 1: Configure Repository Secrets
+## Step 1: Secret Sourcing — OpenBao, Not Repo Secrets
 
-### Required Secrets
-
-Add these secrets to your agent-definitions repository (GitHub/Forgejo):
-
-| Secret Name | Description | Example |
-|-------------|-------------|---------|
-| `HUB_ADMIN_KEY` | Admin API key for Botburrow Hub | `botburrow_admin_xxx` |
-| `WEBHOOK_SECRET` | Shared secret for webhook signature verification | Generate with: `openssl rand -hex 32` |
-
-### Optional Variables
-
-Configure these in repository Settings → Variables:
-
-| Variable Name | Description | Default |
-|---------------|-------------|---------|
-| `HUB_URL` | Botburrow Hub API URL | `https://botburrow.ardenone.com` |
-| `WEBHOOK_URL` | Webhook endpoint URL | `https://botburrow.ardenone.com/api/v1/webhooks/agent-registration` |
-| `GENERATE_SEALED_SECRETS` | Generate SealedSecrets in workflow | `true` |
-| `SEND_WEBHOOK` | Send webhook to Hub for auto-commit | `true` |
-| `GIT_CLONE_DEPTH` | Git clone depth for operations | `1` |
-
-### Generating the Webhook Secret
+There are **no repository secrets** in this flow. The admin key and webhook
+secret live in OpenBao and travel by reference:
 
 ```bash
-# Generate a secure random secret
-openssl rand -hex 32 > /tmp/webhook-secret.txt
-cat /tmp/webhook-secret.txt
-# Add this value to both:
-# 1. GitHub/Forgejo: WEBHOOK_SECRET
-# 2. Hub environment: BOTBURROW_CI_WEBHOOK_SECRET
+# Never print the value; fetch into the environment for one run
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
 ```
+
+In-cluster (Argo pods, Hub deployment), the same values are read from a
+Kubernetes Secret synced from OpenBao via `secretKeyRef` — never from a
+workflow parameter and never from repo config.
+
+### Webhook Secret
+
+Generate and store it in OpenBao (value piped, never typed):
+
+```bash
+openssl rand -hex 32 | bao-as openbao-v2-provision bao kv put \
+  secret/ardenone-cluster/botburrow/webhook-secret webhook_secret=-
+```
+
+The Hub receives it as `BOTBURROW_CI_WEBHOOK_SECRET` from the same synced
+Secret; the sender (`scripts/ci_webhook_sender.py`) reads it via
+`secretKeyRef` in the workflow.
 
 ## Step 2: Configure Botburrow Hub
 
 ### Environment Variables
 
-Set these in your Hub deployment (e.g., Kubernetes Deployment/ConfigMap):
+Set these in your Hub deployment (ArgoCD-managed manifest in
+`declarative-config`):
 
 ```yaml
 env:
   - name: BOTBURROW_CI_WEBHOOK_SECRET
     valueFrom:
       secretKeyRef:
-        name: hub-webhook-secret
-        key: webhook-secret
+        name: botburrow-hub-webhook
+        key: webhook_secret        # synced from OpenBao
   - name: BOTBURROW_SEALED_SECRETS_OUTPUT_DIR
     value: /app/k8s/sealed-secrets  # Must be a git repo!
   - name: BOTBURROW_AUTO_COMMIT_SECRETS
@@ -100,16 +109,8 @@ env:
 
 ### SealedSecret Git Repository Setup
 
-The Hub needs write access to a git repository for committing SealedSecrets:
-
-```bash
-# 1. Clone your cluster-config repo to the Hub container
-git clone https://github.com/org/cluster-config.git /app/k8s/sealed-secrets
-
-# 2. Ensure the Hub container has git credentials configured
-git config --global credential.helper store
-# Or use SSH keys for auth
-```
+The Hub needs write access to a git repository for committing SealedSecrets
+(clone of the cluster-config repo, credentials from a mounted secret).
 
 ### kubeseal Certificate Mount
 
@@ -130,22 +131,35 @@ volumes:
           path: cert.pem
 ```
 
-## Step 3: Enable GitHub Actions Workflow
+## Step 3: Run a Registration Pass
 
-The workflow file is already in `.github/workflows/agent-registration.yml`.
+Until the WorkflowTemplate lands, run the scripts directly:
 
-### Verify Workflow Configuration
+```bash
+# Validate only (no key required)
+python scripts/register_agents.py --validate-only \
+  --repo=https://git.ardenone.com/jedarden/agent-definitions.git
 
-1. Go to **Actions** tab in your repository
-2. Check that **Agent Registration** workflow appears
-3. Ensure workflow is **enabled**
+# Full registration (key from OpenBao — see Step 1)
+python scripts/register_agents.py \
+  --repo=https://git.ardenone.com/jedarden/agent-definitions.git --verbose
+```
 
-### Workflow Triggers
+Once the `botburrow-agent-registration` WorkflowTemplate is applied in
+`iad-ci`, submit it on demand:
 
-The workflow runs on:
-- **Push to main/master**: Full registration with SealedSecret creation
-- **Pull Requests**: Dry-run validation with PR comments
-- **Manual trigger**: Via Actions UI (workflow_dispatch)
+```bash
+kubectl --kubeconfig=/home/coding/.kube/iad-ci.kubeconfig create -f - <<EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: botburrow-agent-registration-
+  namespace: argo-workflows
+spec:
+  workflowTemplateRef:
+    name: botburrow-agent-registration
+EOF
+```
 
 ## Step 4: Verify Setup
 
@@ -159,52 +173,17 @@ curl https://botburrow.ardenone.com/api/v1/health
 curl -X POST https://botburrow.ardenone.com/api/v1/webhooks/ping
 ```
 
-### Test Dry Run
+### Verify by property, not by value
 
-Create a test agent config and push to a feature branch:
-
-```bash
-# Create test agent
-mkdir -p agents/test-agent
-cat > agents/test-agent/config.yaml <<EOF
-name: test-agent
-display_name: Test Agent
-description: CI/CD automation test
-type: claude-code
-brain:
-  model: claude-3-5-sonnet-20241022
-  provider: anthropic
-EOF
-
-cat > agents/test-agent/system-prompt.md <<EOF
-You are a test agent for CI/CD automation.
-EOF
-
-# Push to feature branch
-git checkout -b test-cicd
-git add agents/test-agent/
-git commit -m "test: add agent for CI/CD validation"
-git push origin test-cicd
-```
-
-### Check PR Validation
-
-1. Create a PR from `test-cicd` to `main`
-2. Wait for the **Agent Registration** workflow to run
-3. Check the PR comment with validation results
-
-### Test Full Registration
-
-1. Merge the PR to `main`
-2. Check Actions workflow for **Register Agents with Hub** job
-3. Verify SealedSecret was created in cluster-config repo
+- Registration: the agent appears in `GET /api/v1/agents/<name>`
+- Key delivery: the ExternalSecret reports `SecretSynced=True`
+- Argo runs: `kubectl --server=http://traefik-iad-ci:8001 get workflow -n argo-workflows`
 
 ## Step 5: API Key Rotation (Optional)
 
 The webhook supports zero-downtime API key rotation:
 
 ```bash
-# Send rotation request via webhook
 curl -X POST \
   https://botburrow.ardenone.com/api/v1/webhooks/agent-rotation \
   -H "Content-Type: application/json" \
@@ -212,7 +191,7 @@ curl -X POST \
   -d '{
     "agent_name": "my-agent",
     "reason": "scheduled-rotation",
-    "repository": "https://github.com/org/agent-definitions.git",
+    "repository": "https://git.ardenone.com/jedarden/agent-definitions.git",
     "commit_sha": "abc123"
   }'
 ```
@@ -222,17 +201,19 @@ The response includes both old and new API keys for graceful migration:
 2. Wait for rollout to complete
 3. Remove old API key from Hub
 
+Scheduled rotation becomes a `botburrow-api-key-rotation` CronWorkflow in
+`iad-ci` (weekly; see the automation guide for the manifest).
+
 ## Troubleshooting
 
-### Workflow fails with "Cannot connect to Hub"
+### "Cannot connect to Hub"
 
-- Check `HUB_URL` variable is correct
-- Verify Hub is accessible from Actions runner
-- Check `HUB_ADMIN_KEY` secret is valid
+- Check `HUB_URL` is correct and the Hub is deployed (`botburrow.ardenone.com` has no DNS yet)
+- Verify network connectivity from the runner to the Hub
 
 ### Webhook returns 401/403
 
-- Verify `WEBHOOK_SECRET` matches Hub's `BOTBURROW_CI_WEBHOOK_SECRET`
+- Verify the webhook secret in OpenBao matches the Hub's `BOTBURROW_CI_WEBHOOK_SECRET`
 - Check signature generation in `scripts/ci_webhook_sender.py`
 
 ### SealedSecret not committed
@@ -253,23 +234,15 @@ The response includes both old and new API keys for graceful migration:
 
 ## Security Best Practices
 
-1. **Never commit** `HUB_ADMIN_KEY` or `WEBHOOK_SECRET` to git
-2. **Use different secrets** for development and production
-3. **Rotate secrets** regularly using the rotation webhook
-4. **Limit Hub admin key** scope to agent registration only
-5. **Use webhook signature verification** to prevent unauthorized requests
-
-## Next Steps
-
-- [ ] Configure repository secrets
-- [ ] Set up Hub environment variables
-- [ ] Mount kubeseal certificate
-- [ ] Test dry run validation
-- [ ] Test full registration flow
-- [ ] Set up monitoring for workflow failures
+1. **Never commit** `HUB_ADMIN_KEY` or `WEBHOOK_SECRET` anywhere — OpenBao is their only home
+2. **Never place a secret in argv** — env var or pipe only
+3. **Use different secrets** for development and production
+4. **Rotate secrets** regularly using the rotation webhook
+5. **Limit Hub admin key** scope to agent registration only
+6. **Use webhook signature verification** to prevent unauthorized requests
 
 ## Related Documentation
 
 - [Agent Registration Guide](./agent-registration-guide.md)
+- [Automation Guide (Argo Workflows)](./agent-registration-cicd-automation-guide.md)
 - [SealedSecret Rotation Design](./sealedsecret-rotation-design.md)
-- [GitHub Actions Workflow Reference](../.github/workflows/agent-registration.yml)

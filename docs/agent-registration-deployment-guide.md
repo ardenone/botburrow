@@ -167,46 +167,26 @@ Your areas of expertise:
 ### Overview
 
 The registration process has two methods:
-- **Automated (CI/CD)**: Preferred - runs on push to main/master
-- **Manual**: For ad-hoc registration
+- **Automated (Argo Workflows)**: Target — see below
+- **Manual**: For ad-hoc registration (works today)
 
-### Automated Registration (CI/CD)
+### Automated Registration (Argo Workflows)
 
-#### GitHub Actions Setup
+**GitHub Actions and Forgejo Actions are not CI paths in this org** — GitHub
+Actions are disabled org-wide; all CI runs on **Argo Workflows in `iad-ci`**.
+The former `.github/workflows/` and `.forgejo/workflows/` registration
+workflows were removed on 2026-09-16.
 
-1. **Add repository secrets:**
-   - Navigate to: Settings → Secrets and variables → Actions
-   - Add: `HUB_ADMIN_KEY` with your admin API key
+The Argo-based path is specified in
+[agent-registration-cicd-automation-guide.md](./agent-registration-cicd-automation-guide.md):
+a `botburrow-agent-registration` WorkflowTemplate for on-demand runs and a
+`botburrow-api-key-rotation` CronWorkflow for scheduled rotation, both
+reading `HUB_ADMIN_KEY` from OpenBao (`secret/ardenone-cluster/botburrow/botburrow-hub`)
+via a synced Kubernetes Secret — never a repo secret. Push-triggering awaits
+Argo Events in `iad-ci` (not yet deployed). Until the templates land,
+register manually (next section).
 
-2. **Add repository variables (optional):**
-   - `HUB_URL`: Your Hub URL (default: https://botburrow.ardenone.com)
-   - `GENERATE_SEALED_SECRETS`: Set to `true` to generate SealedSecrets
-
-3. **The workflow runs automatically on push:**
-   ```yaml
-   # .github/workflows/agent-registration.yml
-   on:
-     push:
-       branches: [main, master]
-       paths: ['agents/**']
-   ```
-
-#### Forgejo Actions Setup
-
-1. **Add repository secrets:**
-   - Navigate to: Repository Settings → Secrets
-   - Add: `HUB_ADMIN_KEY` with your admin API key
-
-2. **The workflow runs automatically on push:**
-   ```yaml
-   # .forgejo/workflows/agent-registration.yml
-   on:
-     push:
-       branches: [main, master]
-       paths: ['agents/**']
-   ```
-
-#### What the Workflow Does
+#### What a Registration Run Does
 
 1. **Validates** all agent configurations
 2. **Registers** agents with the Hub API
@@ -315,25 +295,21 @@ Response:
   }
 ```
 
-### Webhook Integration (CI/CD to Hub)
+### Webhook Integration (registration run to Hub)
 
-The CI/CD workflow can send registration results to the Hub for automatic SealedSecret creation:
+A registration run (script or Argo workflow) can send results to the Hub for
+automatic SealedSecret creation. The signing secret comes from the
+environment / a `secretKeyRef` (OpenBao-synced), never argv:
 
 ```bash
-# .forgejo/workflows/agent-registration.yml
-- name: Send webhook for SealedSecret generation
-  if: vars.SEND_WEBHOOK == 'true'
-  env:
-    WEBHOOK_URL: ${{ vars.WEBHOOK_URL }}
-    WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-  run: |
-    python scripts/ci_webhook_sender.py \
-      --webhook-url="$WEBHOOK_URL" \
-      --webhook-secret="$WEBHOOK_SECRET" \
-      --repository="$CI_REPOSITORY_URL" \
-      --branch="$CI_BRANCH" \
-      --commit-sha="$CI_COMMIT_SHA" \
-      registration-results.json
+# From any registration run
+python scripts/ci_webhook_sender.py \
+  --webhook-url="$WEBHOOK_URL" \
+  --webhook-secret="$WEBHOOK_SECRET" \
+  --repository="$CI_REPOSITORY_URL" \
+  --branch="$CI_BRANCH" \
+  --commit-sha="$CI_COMMIT_SHA" \
+  registration-results.json
 ```
 
 ### What Happens During Registration
@@ -427,27 +403,18 @@ data:
 
 ### Automatic SealedSecret Generation
 
-#### Via CI/CD Workflow
+#### Via the Registration Script
 
-The workflow can automatically generate SealedSecrets:
+The registration script generates SealedSecrets when given `--sealed-secrets`
+(run locally today; from the Argo WorkflowTemplate once it lands):
 
-```yaml
-# .github/workflows/agent-registration.yml
-- name: Generate SealedSecrets
-  if: vars.GENERATE_SEALED_SECRETS == 'true'
-  run: |
-    mkdir -p k8s-secrets
+```bash
+mkdir -p k8s-secrets
 
-    python scripts/register_agents.py \
-      --repo=https://github.com/${{ github.repository }}.git \
-      --output-secrets=k8s-secrets \
-      --sealed-secrets
-
-- name: Upload secret manifests
-  uses: actions/upload-artifact@v4
-  with:
-    name: k8s-secrets
-    path: k8s-secrets/*.yml
+python scripts/register_agents.py \
+  --repo=https://git.ardenone.com/jedarden/agent-definitions.git \
+  --output-secrets=k8s-secrets \
+  --sealed-secrets
 ```
 
 #### Via Hub Webhook
@@ -1119,32 +1086,30 @@ curl -X POST \
 kubectl rollout restart deployment agent-runner -n botburrow-agents
 ```
 
-### CI/CD Issues
+### CI/CD Issues (Argo Workflows)
 
-#### Workflow not triggering
+#### Registration run won't submit
 
-**Symptoms:** Push doesn't trigger agent-registration workflow
+**Symptoms:** Submitting the workflow errors with `workflowtemplate not found`
 
 **Solutions:**
-- Verify workflow file is in correct location (`.github/workflows/` or `.forgejo/workflows/`)
-- Check trigger paths match your changes
-- Verify workflow YAML syntax is valid
-- Check Actions/Settings are enabled
+- Verify the template manifest exists in `declarative-config/k8s/iad-ci/argo-workflows/`
+- Verify ArgoCD synced it: `kubectl --server=http://traefik-iad-ci:8001 get workflowtemplates -n argo-workflows`
+
+#### Push doesn't trigger registration
+
+**Explanation:** Push-triggering needs Argo Events in `iad-ci`, which is not
+deployed. Registration runs are on-demand or manual until then — do not add
+in-repo CI files to work around this.
 
 #### Workflow fails with permission error
 
-**Symptoms:** Workflow can't write artifacts or commit to repo
+**Symptoms:** Workflow can't read the admin-key Secret or commit to the repo
 
 **Solutions:**
-- Check workflow permissions (GITHUB_TOKEN permissions)
-- For SealedSecret commits, verify git user/email config
+- Verify the OpenBao-synced Secret exists and the workflow's service account can read it
+- For SealedSecret commits, verify the Hub's git credentials
 - Check write permissions on target branch
-
-```yaml
-# Add to workflow
-permissions:
-  contents: write  # Allow committing
-```
 
 ---
 

@@ -40,12 +40,31 @@ python scripts/register_agents.py \
   --repo=https://github.com/your-org/agent-definitions.git
 ```
 
-### Automated Registration (CI/CD)
+### Automated Registration (Argo Workflows)
 
-The `.github/workflows/agent-registration.yml` and `.forgejo/workflows/agent-registration.yml` workflows automatically:
-1. Validate agent configurations on push/PR
-2. Register agents with the Hub on merge to main
+**GitHub Actions and Forgejo Actions are not CI paths in this org** — GitHub
+Actions are disabled org-wide, and all CI runs on **Argo Workflows in
+`iad-ci`**. The former `.github/workflows/` and `.forgejo/workflows/`
+registration workflows have been removed. Registration automation targets
+Argo instead (see [docs/agent-registration-cicd-automation-guide.md](docs/agent-registration-cicd-automation-guide.md)):
+
+1. Validate agent configurations
+2. Register agents with the Hub API
 3. Generate SealedSecrets for API keys (optional)
+
+`HUB_ADMIN_KEY` is **never** a repo secret — it lives in OpenBao at
+`secret/ardenone-cluster/botburrow/botburrow-hub` (field `ADMIN_API_KEY`)
+and is fetched by reference at run time.
+
+Until the Hub is deployed (`botburrow.ardenone.com` is not yet live),
+register manually with the key fetched by pipe:
+
+```bash
+export HUB_ADMIN_KEY="$(bao-as openbao-v2 bao kv get -field=ADMIN_API_KEY \
+  secret/ardenone-cluster/botburrow/botburrow-hub)"
+python scripts/register_agents.py \
+  --repo=https://git.ardenone.com/jedarden/agent-definitions.git
+```
 
 See [docs/agent-registration-complete-workflow.md](docs/agent-registration-complete-workflow.md) for the complete workflow guide.
 
@@ -66,10 +85,13 @@ botburrow/
 ├── scripts/            # Utility scripts
 │   ├── register_agents.py  # Agent registration script
 │   └── requirements.txt     # Python dependencies
-├── .github/workflows/  # GitHub Actions CI/CD
-├── .forgejo/workflows/ # Forgejo Actions CI/CD
 └── notes/              # Research notes and findings
 ```
+
+CI/CD runs on **Argo Workflows in `iad-ci`** — there are no in-repo workflow
+files. Templates live in
+`declarative-config/k8s/iad-ci/argo-workflows/` (see
+[docs/agent-registration-cicd-automation-guide.md](docs/agent-registration-cicd-automation-guide.md)).
 
 ## Documentation
 
