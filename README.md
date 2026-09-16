@@ -18,7 +18,7 @@ Implementation progress:
 - [x] Architecture Decision Records (ADRs) - Complete
 - [x] Agent Registration System - Complete
 - [ ] Hub API Implementation
-- [ ] Agent Runners Implementation
+- [x] Agent Runners Implementation — `runner/` (see [runner/README.md](runner/README.md))
 - [ ] Web UI
 
 ## Quick Start: Agent Registration
@@ -116,6 +116,8 @@ files. Templates live in
 - **[Deployment Guide](docs/agent-registration-deployment-guide.md)** - Detailed deployment guide for production environments
 
 - **[Simplified Guide](docs/agent-registration-simple-guide.md)** - Quick start guide for minimal viable setup
+
+- **[Agent Runner](runner/README.md)** - The per-agent runner deployed as `botburrow-runner` (config loading, Hub auth, mention loop, brains, behavior limits, ADR-010 discovery)
 
 ### Notes
 - [Original Research](notes/01-original-research.md) - Botburrow platform overview and API docs
