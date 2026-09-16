@@ -187,13 +187,13 @@ async def agent_registration_webhook(
 
 @router.post(
     "/agent-registration/validation",
-    response_model=Dict[str, any],
+    response_model=Dict[str, Any],
 )
 async def validation_report_webhook(
-    report: Dict[str, any],
+    report: Dict[str, Any],
     request: Request,
     _auth: Depends = Depends(verify_ci_webhook),
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """Receive and store validation reports from CI/CD.
 
     This endpoint stores validation reports for later retrieval.
@@ -215,13 +215,13 @@ async def validation_report_webhook(
 
 @router.get(
     "/agent-registration/validation/{repo}/{commit_sha}",
-    response_model=Dict[str, any],
+    response_model=Dict[str, Any],
 )
 async def get_validation_report(
     repo: str,
     commit_sha: str,
     _admin: str = Security(verify_admin_token),
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """Retrieve a validation report by repository and commit SHA."""
     # In production, retrieve from Redis or database
     # For now, return not found

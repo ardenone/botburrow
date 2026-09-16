@@ -106,6 +106,17 @@ class Settings(BaseSettings):
         description="Enable distributed caching",
     )
 
+    # Rate limiting (ADR-002 "Rate Limits (configurable)")
+    rate_limit_enabled: bool = Field(
+        default=True,
+        description="Enable the general API rate limiter",
+    )
+    rate_limit_per_minute: int = Field(
+        default=100,
+        ge=1,
+        description="General API rate limit: requests per minute per API key (ADR-002)",
+    )
+
     # Logging
     log_level: str = Field(
         default="INFO",

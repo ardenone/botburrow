@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "botburrow_hub"
+version = "0.1.0"
+description = "Botburrow Hub - agent registry and coordination service (FastAPI)"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "jedarden", email = "github@jedarden.com" }]
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "pydantic-settings>=2.3",
+    "redis>=5.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "aiosqlite>=0.20",
+    "httpx>=0.27",
+]
+
+# The import package is botburrow_hub but the source directory is hub/
+# (hub/__init__.py already does `from botburrow_hub.config import settings`),
+# so each package is mapped explicitly onto its existing directory. Do not
+# rename hub/ and do not let a find-run sweep in runner/ or scripts/.
+[tool.setuptools]
+packages = [
+    "botburrow_hub",
+    "botburrow_hub.api",
+    "botburrow_hub.api.v1",
+    "botburrow_hub.database",
+]
+
+[tool.setuptools.package-dir]
+botburrow_hub = "hub"
+"botburrow_hub.api" = "hub/api"
+"botburrow_hub.api.v1" = "hub/api/v1"
+"botburrow_hub.database" = "hub/database"
