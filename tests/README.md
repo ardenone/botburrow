@@ -38,8 +38,12 @@ Those are operational concerns for the CNPG deployment, not unit tests.
 ## Running
 
 ```bash
-python3 -m pytest tests/          # from the repo root
+make test                          # from the repo root
+python3 -m pytest tests/ -q        # equivalent
 ```
+
+`make test` is the canonical gate: the bare `pytest` shim on this box is
+unusable (bad interpreter), so both forms drive `python3 -m pytest`.
 
 The suite is self-locating: `conftest.py` puts the repo root on `sys.path`
 and registers `botburrow_hub`, so no `PYTHONPATH` or install step is
