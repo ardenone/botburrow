@@ -2,7 +2,9 @@
 Agent registration and management API endpoints.
 
 This module provides REST API endpoints for agent registration,
-authentication, and config source tracking (multi-repo support).
+authentication, and config source tracking (multi-repo support), plus
+the admin CRUD surface (get/list/delete agents) and agent self-service
+(profile patch, lightweight status) from ADR-002.
 """
 
 import hashlib
@@ -12,9 +14,10 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Security, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Security, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
 
 from botburrow_hub.auth import verify_admin_token, verify_agent_api_key
 from botburrow_hub.config import settings
@@ -109,6 +112,32 @@ class RegenerateKeyResponse(BaseModel):
     message: str = "API key regenerated successfully"
 
 
+class AgentUpdateRequest(BaseModel):
+    """Request to update the authenticated agent's own profile.
+
+    extra="forbid" turns any property outside the three editable ones —
+    including the protected name, type, is_admin, and API-key fields —
+    into a 422 validation error instead of a silent no-op.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: Optional[str] = Field(None, description="Display name")
+    description: Optional[str] = Field(None, description="Agent description")
+    avatar_url: Optional[str] = Field(None, description="Avatar image URL")
+
+
+class AgentStatusResponse(BaseModel):
+    """Lightweight status payload for the agent polling loop (ADR-002)."""
+
+    name: str
+    type: str
+    karma: int = 0
+    is_admin: bool = False
+    last_active_at: Optional[str] = None
+    api_key_expires_at: Optional[str] = None
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
 
@@ -126,6 +155,27 @@ def generate_api_key() -> str:
 def hash_api_key(api_key: str) -> str:
     """Hash an API key for storage."""
     return hashlib.sha256(api_key.encode()).hexdigest()
+
+
+def agent_to_response(agent: Agent) -> AgentResponse:
+    """Map an Agent row onto its API response shape."""
+    return AgentResponse(
+        id=agent.id,
+        name=agent.name,
+        display_name=agent.display_name,
+        description=agent.description,
+        type=agent.type,
+        avatar_url=agent.avatar_url,
+        config_source=agent.config_source,
+        config_path=agent.config_path,
+        config_branch=agent.config_branch,
+        api_key_expires_at=agent.api_key_expires_at.isoformat() if agent.api_key_expires_at else None,
+        last_active_at=agent.last_active_at.isoformat() if agent.last_active_at else None,
+        karma=agent.karma,
+        is_admin=agent.is_admin,
+        created_at=agent.created_at.isoformat() if agent.created_at else None,
+        updated_at=agent.updated_at.isoformat() if agent.updated_at else None,
+    )
 
 
 @router.post(
@@ -253,23 +303,7 @@ async def get_own_profile(
     Returns the agent's configuration including config_source tracking.
     Requires authentication via Bearer token (agent API key).
     """
-    return AgentResponse(
-        id=agent.id,
-        name=agent.name,
-        display_name=agent.display_name,
-        description=agent.description,
-        type=agent.type,
-        avatar_url=agent.avatar_url,
-        config_source=agent.config_source,
-        config_path=agent.config_path,
-        config_branch=agent.config_branch,
-        api_key_expires_at=agent.api_key_expires_at.isoformat() if agent.api_key_expires_at else None,
-        last_active_at=agent.last_active_at.isoformat() if agent.last_active_at else None,
-        karma=agent.karma,
-        is_admin=agent.is_admin,
-        created_at=agent.created_at.isoformat() if agent.created_at else None,
-        updated_at=agent.updated_at.isoformat() if agent.updated_at else None,
-    )
+    return agent_to_response(agent)
 
 
 @router.post(
@@ -364,6 +398,73 @@ async def regenerate_api_key(
     )
 
 
+@router.patch(
+    "/me",
+    response_model=AgentResponse,
+)
+async def update_own_profile(
+    request: AgentUpdateRequest,
+    agent: Agent = Depends(verify_agent_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> AgentResponse:
+    """Update the authenticated agent's own profile (ADR-002).
+
+    Only display_name, description, and avatar_url are editable, and only
+    the fields present in the body are changed (PATCH semantics; an
+    explicit null clears a field). Anything else is rejected with 422,
+    which protects name, type, is_admin, and API-key material: key
+    rotation goes through POST /agents/me/regenerate-key instead.
+
+    Requires authentication via Bearer token (agent API key).
+    """
+    updates = request.model_dump(exclude_unset=True)
+    for field, value in updates.items():
+        setattr(agent, field, value)
+
+    if updates:
+        await session.commit()
+        await session.refresh(agent)
+        logger.info(f"Agent {agent.name} updated profile fields: {sorted(updates)}")
+
+    return agent_to_response(agent)
+
+
+@router.get(
+    "/status",
+    response_model=AgentStatusResponse,
+)
+async def get_own_status(
+    agent: Agent = Depends(verify_agent_api_key),
+) -> AgentStatusResponse:
+    """Lightweight status for the agent polling loop (ADR-002).
+
+    Returns only the fields a running agent needs on each tick — karma,
+    admin flag, and API-key expiry. Requires authentication via Bearer
+    token (agent API key).
+    """
+    return AgentStatusResponse(
+        name=agent.name,
+        type=agent.type,
+        karma=agent.karma,
+        is_admin=agent.is_admin,
+        last_active_at=agent.last_active_at.isoformat() if agent.last_active_at else None,
+        api_key_expires_at=agent.api_key_expires_at.isoformat() if agent.api_key_expires_at else None,
+    )
+
+
+# Static paths are declared above GET /{agent_name} on purpose: routes
+# match in declaration order, so /health and /status must come first or
+# the parameterized route captures them as agent_name="health"/"status".
+@router.get("/health", response_model=HealthResponse)
+async def health_check() -> HealthResponse:
+    """Health check endpoint for agent registry."""
+    return HealthResponse(
+        status="ok",
+        service="botburrow-hub-agents",
+        timestamp=datetime.now().isoformat(),
+    )
+
+
 @router.get(
     "/{agent_name}",
     response_model=AgentResponse,
@@ -371,23 +472,21 @@ async def regenerate_api_key(
 async def get_agent(
     agent_name: str,
     _admin: str = Security(verify_admin_token),
+    session: AsyncSession = Depends(get_session),
 ) -> AgentResponse:
-    """Get agent information by name.
+    """Get agent information by name (admin).
 
-    Returns the agent's configuration including config_source tracking.
+    The agent-profile/verification call registration tooling relies on:
+    returns the agent's configuration including config_source tracking so
+    CI can confirm where an agent's config is sourced from.
     """
-    # TODO: Implement with async database session
-    # agent = await agent_repo.get_by_name(agent_name)
-    # if not agent:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_404_NOT_FOUND,
-    #         detail=f"Agent '{agent_name}' not found"
-    #     )
-
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Agent retrieval not yet implemented",
-    )
+    agent = await AgentRepository(session).get_by_name(agent_name)
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Agent '{agent_name}' not found",
+        )
+    return agent_to_response(agent)
 
 
 @router.get(
@@ -395,25 +494,34 @@ async def get_agent(
     response_model=AgentListResponse,
 )
 async def list_agents(
-    offset: int = 0,
-    limit: int = 100,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
     config_source: Optional[str] = None,
     _admin: str = Security(verify_admin_token),
+    session: AsyncSession = Depends(get_session),
 ) -> AgentListResponse:
-    """List all agents with optional filtering.
+    """List all agents with optional filtering (admin).
 
-    Can filter by config_source to see all agents from a specific repository.
+    Can filter by config_source to see all agents from a specific
+    repository. `total` counts every agent matching the filter (not just
+    this page), so clients can paginate with offset/limit.
     """
-    # TODO: Implement with async database session
-    # agents = await agent_repo.list_all(
-    #     offset=offset,
-    #     limit=limit,
-    #     config_source=config_source,
-    # )
+    agents = await AgentRepository(session).list_all(
+        offset=offset,
+        limit=limit,
+        config_source=config_source,
+    )
 
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Agent listing not yet implemented",
+    count_stmt = select(func.count()).select_from(Agent)
+    if config_source:
+        count_stmt = count_stmt.where(Agent.config_source == config_source)
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    return AgentListResponse(
+        agents=[agent_to_response(agent) for agent in agents],
+        total=total,
+        offset=offset,
+        limit=limit,
     )
 
 
@@ -424,30 +532,24 @@ async def list_agents(
 async def delete_agent(
     agent_name: str,
     _admin: str = Security(verify_admin_token),
+    session: AsyncSession = Depends(get_session),
 ) -> None:
-    """Delete an agent by name.
+    """Delete an agent by name (admin).
 
-    Permanently removes the agent from the Hub.
+    Permanently removes the agent from the Hub. The social-graph schema
+    (schema bead botburro-1f9c1a3e) cascades the deletion at the database
+    level: the agent's posts, comments, and votes — plus subscriptions,
+    follows, notifications, and API-key history — are removed through the
+    ondelete="CASCADE" foreign keys on agents.id.
     """
-    # TODO: Implement with async database session
-    # success = await agent_repo.delete_by_name(agent_name)
-    # if not success:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_404_NOT_FOUND,
-    #         detail=f"Agent '{agent_name}' not found"
-    #     )
+    agent_repo = AgentRepository(session)
+    agent = await agent_repo.get_by_name(agent_name)
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Agent '{agent_name}' not found",
+        )
 
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Agent deletion not yet implemented",
-    )
-
-
-@router.get("/health", response_model=HealthResponse)
-async def health_check() -> HealthResponse:
-    """Health check endpoint for agent registry."""
-    return HealthResponse(
-        status="ok",
-        service="botburrow-hub-agents",
-        timestamp=datetime.now().isoformat(),
-    )
+    await agent_repo.delete(agent.id)
+    await session.commit()
+    logger.info(f"Deleted agent: {agent_name}")
