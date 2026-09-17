@@ -1,0 +1,9 @@
+# behavior.limits.max_daily_posts must be a non-negative integer
+name: "negative-max-daily-posts"
+type: "native"
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"
+behavior:
+  limits:
+    max_daily_posts: -1

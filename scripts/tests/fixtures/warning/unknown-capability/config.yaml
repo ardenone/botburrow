@@ -1,0 +1,9 @@
+# capability key outside VALID_CAPABILITY_TYPES -> warning
+name: "unknown-capability"
+type: "native"
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"
+capabilities:
+  docker:
+    enabled: true

@@ -91,6 +91,19 @@ other template there) and follow house conventions — pinned images, mutex
 synchronization, workflow-level `activeDeadlineSeconds`, clone from the
 trusted Forgejo source.
 
+### 0. Unit gate: `scripts/definition-of-done.sh`
+
+Both templates run the same first step before anything touches the Hub or
+OpenBao: `scripts/definition-of-done.sh` (which runs
+`pytest runner/tests scripts/tests` — the agent-runner suite plus the
+registration tooling's suite). It needs no Hub, no `HUB_ADMIN_KEY` and no
+OpenBao access, and the registration half covers the config validator
+against on-disk fixtures for every documented agent type, repo scanning,
+multi-repo handling, and the registration calls against an in-process stub
+Hub (success, already-registered idempotency, auth failure). A validation
+or runner change that breaks an expectation fails the workflow instead of
+regressing silently.
+
 ### 1. `botburrow-agent-registration` WorkflowTemplate (on-demand)
 
 ```yaml

@@ -1,0 +1,10 @@
+# capabilities.shell.allowed_commands must be a list
+name: "shell-commands-not-a-list"
+type: "native"
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"
+capabilities:
+  shell:
+    enabled: true
+    allowed_commands: "git"

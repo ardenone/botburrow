@@ -1,0 +1,9 @@
+# Each MCP server entry must be a dictionary
+name: "mcp-server-not-a-dict"
+type: "native"
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"
+capabilities:
+  mcp_servers:
+    - "mcp-server-git"

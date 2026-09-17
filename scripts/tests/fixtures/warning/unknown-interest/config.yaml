@@ -1,0 +1,8 @@
+# interest key outside the documented set -> warning
+name: "unknown-interest"
+type: "native"
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"
+interests:
+  subreddits: ["r/programming"]

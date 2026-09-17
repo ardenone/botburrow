@@ -1,0 +1,7 @@
+# type not in VALID_AGENT_TYPES (cursor appears in ADR-017 as a candidate
+# tool but is not (yet) a documented Botburrow type) -> warning
+name: "unknown-agent-type"
+type: "cursor"
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"

@@ -1,0 +1,27 @@
+# Valid opencode agent (ADR-017: OpenCode CLI, multi-provider)
+name: "opencode-agent"
+display_name: "OpenCode Agent"
+description: "Fixture: valid opencode agent"
+type: "opencode"
+
+brain:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  max_tokens: 2048
+  temperature: 0.4
+
+capabilities:
+  network:
+    enabled: true
+  mcp_servers:
+    - name: "search"
+      command: "mcp-server-search"
+
+interests:
+  topics: ["search"]
+  keywords: ["docs"]
+
+behavior:
+  limits:
+    max_daily_posts: 3
+    max_daily_comments: 12

@@ -16,26 +16,24 @@ Tests cover:
 - Validation report generation
 """
 
-import contextlib
 import json
 import shutil
 import subprocess
 import tempfile
 import threading
-import uuid
-import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 
 import pytest
+import requests
 import yaml
 
 # Import the modules to test
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import register_agents
 from register_agents import (
     AgentConfig,
     AgentValidationReport,
@@ -47,8 +45,9 @@ from register_agents import (
     load_repos_config,
     get_git_info,
     generate_validation_report,
+    main,
 )
-from openbao_store import OpenBaoReference
+from openbao_store import OpenBaoDeliveryError, OpenBaoReference
 
 # Directory holding the config.yaml / system-prompt.md fixtures used by the
 # validator, repo-scanning and multi-repo tests below.
@@ -692,3 +691,532 @@ class TestUtilityFunctions:
         )
 
         assert "All 2 agent(s) failed validation" in report.summary
+
+
+# ---------------------------------------------------------------------------
+# Fixture-driven validation coverage
+#
+# scripts/tests/fixtures/ holds on-disk config.yaml / system-prompt.md
+# pairs: one per documented agent type under valid/, plus invalid/ and
+# warning/ cases. FIXTURE_EXPECTATIONS states, per fixture, the one
+# message the validator must produce. A fixture directory with no entry
+# here fails test_every_fixture_has_an_expectation, so a new fixture
+# cannot be added without stating what it proves, and a validator change
+# that breaks an expectation fails instead of regressing silently.
+# ---------------------------------------------------------------------------
+
+FIXTURE_EXPECTATIONS = {
+    "invalid": {
+        "Invalid_Agent": "must be lowercase",
+        "bad-max-tokens": "max_tokens",
+        "bad-temperature": "temperature",
+        "mcp-server-missing-command": "missing 'command'",
+        "mcp-server-missing-name": "missing 'name'",
+        "mcp-server-not-a-dict": "must be a dictionary",
+        "mcp-servers-not-a-list": "mcp_servers must be a list",
+        "negative-max-daily-comments": "max_daily_comments",
+        "negative-max-daily-posts": "max_daily_posts",
+        "shell-commands-not-a-list": "allowed_commands must be a list",
+    },
+    "valid": {
+        # name -> the documented agent type the fixture must carry
+        "aider-agent": "aider",
+        "claude-agent": "claude",
+        "claude-code-agent": "claude-code",
+        "goose-agent": "goose",
+        "native-agent": "native",
+        "opencode-agent": "opencode",
+    },
+    "warning": {
+        "brain-minimal": "No brain configuration found",
+        "brain-no-model-or-provider": "missing 'model' or 'provider'",
+        "unknown-agent-type": "Unknown agent type",
+        "unknown-capability": "Unknown capability type",
+        "unknown-interest": "Unknown interest type",
+    },
+}
+
+
+class TestFixtureDrivenValidation:
+    """Validate every on-disk fixture through ConfigValidator."""
+
+    def test_every_fixture_has_an_expectation(self):
+        """A fixture without a stated expectation means a silent no-op test."""
+        for category in ("invalid", "valid", "warning"):
+            for name in fixture_cases(category):
+                assert name in FIXTURE_EXPECTATIONS[category], (
+                    f"fixtures/{category}/{name} has no entry in "
+                    "FIXTURE_EXPECTATIONS; state what it proves"
+                )
+
+    def test_validator_types_match_documented_types(self):
+        """The validator's accepted set must not drift from the docs."""
+        assert ConfigValidator.VALID_AGENT_TYPES == DOCUMENTED_AGENT_TYPES
+
+    def test_valid_fixtures_cover_every_documented_type(self):
+        """Every documented agent type has a valid fixture."""
+        assert set(FIXTURE_EXPECTATIONS["valid"].values()) == (
+            DOCUMENTED_AGENT_TYPES
+        )
+
+    @pytest.mark.parametrize("name", sorted(FIXTURE_EXPECTATIONS["valid"]))
+    def test_valid_fixtures_validate_clean(self, name):
+        config, prompt = load_fixture("valid", name)
+        assert config.get("type") == FIXTURE_EXPECTATIONS["valid"][name]
+        result = ConfigValidator().validate_agent(name, config, prompt)
+        assert result.errors == [], result.errors
+        assert result.warnings == [], result.warnings
+        assert result.is_valid
+
+    @pytest.mark.parametrize(
+        "name,expected", sorted(FIXTURE_EXPECTATIONS["invalid"].items())
+    )
+    def test_invalid_fixtures_fail_with_expected_error(self, name, expected):
+        config, prompt = load_fixture("invalid", name)
+        result = ConfigValidator().validate_agent(name, config, prompt)
+        assert not result.is_valid
+        assert any(expected in error for error in result.errors), result.errors
+
+    @pytest.mark.parametrize(
+        "name,expected", sorted(FIXTURE_EXPECTATIONS["warning"].items())
+    )
+    def test_warning_fixtures_pass_with_expected_warning(self, name, expected):
+        config, prompt = load_fixture("warning", name)
+        result = ConfigValidator().validate_agent(name, config, prompt)
+        assert result.is_valid
+        assert result.errors == [], result.errors
+        assert any(expected in warning for warning in result.warnings), (
+            result.warnings
+        )
+
+
+# ---------------------------------------------------------------------------
+# Repo scanning over a tree assembled from the fixtures
+# ---------------------------------------------------------------------------
+
+
+class TestRepoScanningWithFixtures:
+    """GitRepository.get_agents against realistic agents/ trees."""
+
+    @staticmethod
+    def _repo_over(tmp_path, include=()):
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        for name in include:
+            shutil.copytree(FIXTURES_DIR / "valid" / name, agents_dir / name)
+        repo = GitRepository(url="test", branch="main")
+        repo.repo_path = tmp_path
+        return repo
+
+    def test_finds_fixture_agents_and_prompts(self, tmp_path):
+        repo = self._repo_over(tmp_path, ["native-agent", "goose-agent"])
+
+        agents = repo.get_agents()
+
+        assert {config["name"] for _, config, _ in agents} == {
+            "native-agent",
+            "goose-agent",
+        }
+        by_name = {config["name"]: (config, prompt) for _, config, prompt in agents}
+        assert by_name["native-agent"][1] == (
+            FIXTURES_DIR / "valid/native-agent/system-prompt.md"
+        ).read_text()
+        assert by_name["goose-agent"][1] == (
+            FIXTURES_DIR / "valid/goose-agent/system-prompt.md"
+        ).read_text()
+
+    def test_skips_dirs_without_config_and_non_dirs(self, tmp_path):
+        repo = self._repo_over(tmp_path, ["native-agent"])
+        (tmp_path / "agents" / "prompt-only").mkdir()  # no config.yaml
+        (tmp_path / "agents" / "notes.txt").write_text("not an agent dir")
+
+        agents = repo.get_agents()
+
+        assert [config["name"] for _, config, _ in agents] == ["native-agent"]
+
+    def test_skips_malformed_config_without_raising(self, tmp_path):
+        repo = self._repo_over(tmp_path, ["native-agent"])
+        broken = tmp_path / "agents" / "broken"
+        broken.mkdir()
+        (broken / "config.yaml").write_text("brain: [unclosed")
+
+        agents = repo.get_agents()
+
+        assert [config["name"] for _, config, _ in agents] == ["native-agent"]
+
+
+# ---------------------------------------------------------------------------
+# Multi-repo handling
+# ---------------------------------------------------------------------------
+
+
+def build_local_agent_repo(path, agent_names):
+    """git-init a local repo under path with agents/ copied from fixtures.
+
+    Fixture names are looked up in valid/ first, then invalid/, so a mix
+    like ["native-agent", "Invalid_Agent"] builds a repo with one good and
+    one bad agent.
+    """
+    path.mkdir(parents=True)
+    agents_dir = path / "agents"
+    agents_dir.mkdir()
+    for name in agent_names:
+        for category in ("valid", "invalid", "warning"):
+            source = FIXTURES_DIR / category / name
+            if source.is_dir():
+                shutil.copytree(source, agents_dir / name)
+                break
+        else:
+            raise FileNotFoundError(f"no fixture named {name}")
+    git = ["git", "-c", "user.email=github@jedarden.com",
+           "-c", "user.name=jedarden"]
+    subprocess.run(["git", "init", "-b", "main"], cwd=path, check=True,
+                   capture_output=True)
+    subprocess.run(["git", "add", "agents"], cwd=path, check=True,
+                   capture_output=True)
+    subprocess.run(git + ["commit", "-m", "fixture agents"], cwd=path,
+                   check=True, capture_output=True)
+    return path
+
+
+class TestMultiRepoHandling:
+    """Multi-repo behaviour: repos-file parsing and validate-only runs."""
+
+    def test_load_repos_config_mixed_entries(self, tmp_path):
+        config_file = tmp_path / "repos.json"
+        config_file.write_text(json.dumps([
+            {"name": "configured", "url": "https://example.com/a.git",
+             "branch": "release", "auth_type": "token",
+             "auth_secret": "a-token"},
+            "https://example.com/b.git",
+            42,  # not a repo config: skipped with a warning
+        ]))
+
+        repos = load_repos_config(str(config_file))
+
+        assert [r.name for r in repos] == ["configured", "unknown"]
+        assert repos[0].branch == "release"
+        assert repos[0].auth_type == "token"
+        assert repos[1].url == "https://example.com/b.git"
+        assert repos[1].branch == "main"
+
+    def run_main(self, monkeypatch, cwd, argv):
+        monkeypatch.chdir(cwd)
+        monkeypatch.setattr(sys, "argv", ["register_agents.py"] + argv)
+        return main()
+
+    def test_validate_only_across_two_repos(self, tmp_path, monkeypatch):
+        repo_a = build_local_agent_repo(tmp_path / "repo-a",
+                                        ["native-agent", "goose-agent"])
+        repo_b = build_local_agent_repo(tmp_path / "repo-b",
+                                        ["claude-code-agent"])
+        report = tmp_path / "report.json"
+
+        rc = self.run_main(monkeypatch, tmp_path, [
+            "--repo", str(repo_a), "--repo", str(repo_b),
+            "--validate-only", "--output-report", str(report),
+        ])
+
+        assert rc == 0
+        data = json.loads(report.read_text())
+        assert data["total_agents"] == 3
+        assert data["invalid_agents"] == 0
+        sources = {agent["config_source"] for agent in data["agents"]}
+        assert sources == {str(repo_a), str(repo_b)}
+        assert all(agent["valid"] for agent in data["agents"])
+
+    def test_invalid_agent_fails_strict_validate_only(self, tmp_path, monkeypatch):
+        repo = build_local_agent_repo(tmp_path / "repo",
+                                      ["native-agent", "Invalid_Agent"])
+        report = tmp_path / "report.json"
+
+        rc = self.run_main(monkeypatch, tmp_path, [
+            "--repo", str(repo), "--validate-only", "--strict",
+            "--output-report", str(report),
+        ])
+
+        assert rc == 1
+        data = json.loads(report.read_text())
+        assert data["invalid_agents"] == 1
+        invalid = next(a for a in data["agents"] if not a["valid"])
+        assert invalid["name"] == "Invalid_Agent"
+
+    def test_invalid_agent_passes_gate_without_strict(self, tmp_path, monkeypatch):
+        # Pins current semantics: without --strict, validation errors are
+        # reported but do not fail the run. If the gate should hard-fail
+        # CI, change the script and this test together.
+        repo = build_local_agent_repo(tmp_path / "repo",
+                                      ["native-agent", "Invalid_Agent"])
+        report = tmp_path / "report.json"
+
+        rc = self.run_main(monkeypatch, tmp_path, [
+            "--repo", str(repo), "--validate-only",
+            "--output-report", str(report),
+        ])
+
+        assert rc == 0
+        data = json.loads(report.read_text())
+        assert data["invalid_agents"] == 1
+        assert data["valid_agents"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Hub registration against a real HTTP stub Hub
+# ---------------------------------------------------------------------------
+
+
+class _StubHubHandler(BaseHTTPRequestHandler):
+    """Minimal stand-in for the Hub: /api/v1/health + /api/v1/agents/register.
+
+    State lives on the ThreadingHTTPServer instance (admin_key, registered,
+    requests, omit_api_key) so each test configures its own server.
+    """
+
+    def _json(self, code, body):
+        payload = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _authorized(self):
+        return self.headers.get("X-Admin-Key") == self.server.admin_key
+
+    def do_GET(self):
+        if self.path != "/api/v1/health":
+            self._json(404, {"detail": "not found"})
+        elif self._authorized():
+            self._json(200, {"status": "ok"})
+        else:
+            self._json(401, {"detail": "invalid admin key"})
+
+    def do_POST(self):
+        if self.path != "/api/v1/agents/register":
+            self._json(404, {"detail": "not found"})
+            return
+        if not self._authorized():
+            self._json(401, {"detail": "invalid admin key"})
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        payload = json.loads(self.rfile.read(length))
+        self.server.requests.append(payload)
+        name = payload.get("name", "")
+        if name in self.server.registered:
+            # The Hub keeps only a hash, so it can never re-send the key.
+            self._json(200, {"id": f"agent-{name}", "name": name,
+                             "api_key": "(unchanged)"})
+            return
+        self.server.registered.add(name)
+        body = {"id": f"agent-{name}", "name": name,
+                "type": payload.get("type"),
+                "config_source": payload.get("config_source"),
+                "created_at": "2026-09-16T00:00:00Z"}
+        if not self.server.omit_api_key:
+            body["api_key"] = f"botburrow_agent_{name}"
+        self._json(201, body)
+
+    def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+        pass
+
+
+@pytest.fixture
+def stub_hub():
+    """A stub Hub on a random local port; tests talk to it over real HTTP."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _StubHubHandler)
+    server.admin_key = "test-admin-key"
+    server.registered = set()
+    server.requests = []
+    server.omit_api_key = False
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+def registrar_for(server, admin_key=None, key_store=...):
+    """An AgentRegistrar pointed at the stub Hub.
+
+    key_store defaults to a fresh StubKeyStore; pass None explicitly to
+    test the no-store refusal path.
+    """
+    return AgentRegistrar(
+        hub_url=f"http://127.0.0.1:{server.server_address[1]}",
+        admin_key=server.admin_key if admin_key is None else admin_key,
+        key_store=StubKeyStore() if key_store is ... else key_store,
+    )
+
+
+class TestStubHubRegistration:
+    """Integration tests for AgentRegistrar over real HTTP."""
+
+    def test_register_success_delivers_key_and_sanitizes_response(self, stub_hub):
+        key_store = StubKeyStore()
+        registrar = registrar_for(stub_hub, key_store=key_store)
+        config = AgentConfig(name="test-agent", display_name="Test Agent",
+                             type="claude-code")
+
+        result = registrar.register_agent(
+            config,
+            config_source="https://repos.example/agents.git",
+            config_path="agents/test-agent",
+        )
+
+        assert result["name"] == "test-agent"
+        assert result["type"] == "claude-code"
+        assert result["api_key_ref"] == (
+            "secret/ardenone-cluster/botburrow/agents/test-agent"
+        )
+        assert "api_key" not in result  # plaintext consumed, never returned
+        assert key_store.delivered == [
+            ("test-agent", "botburrow_agent_test-agent")
+        ]
+        sent = stub_hub.requests[0]
+        assert sent["type"] == "claude-code"
+        assert sent["config_source"] == "https://repos.example/agents.git"
+        assert sent["config_path"] == "agents/test-agent"
+        assert sent["config_branch"] == "main"
+
+    def test_already_registered_is_idempotent(self, stub_hub):
+        stub_hub.registered.add("test-agent")
+        key_store = StubKeyStore()
+        registrar = registrar_for(stub_hub, key_store=key_store)
+
+        result = registrar.register_agent(
+            AgentConfig(name="test-agent"),
+            config_source="https://repos.example/agents.git",
+            config_path="agents/test-agent",
+        )
+
+        assert result["api_key_delivery"] == "unchanged"
+        assert result["api_key_ref"] == (
+            "secret/ardenone-cluster/botburrow/agents/test-agent"
+        )
+        assert key_store.delivered == []  # nothing delivered: no key returned
+
+    def test_auth_failure_is_rejected(self, stub_hub):
+        registrar = registrar_for(stub_hub, admin_key="wrong-key")
+
+        with pytest.raises(requests.exceptions.HTTPError) as excinfo:
+            registrar.register_agent(
+                AgentConfig(name="test-agent"),
+                config_source="s", config_path="agents/test-agent",
+            )
+
+        assert excinfo.value.response.status_code == 401
+        assert stub_hub.requests == []  # nothing registered
+
+    def test_response_without_key_is_a_delivery_error(self, stub_hub):
+        stub_hub.omit_api_key = True
+        registrar = registrar_for(stub_hub)
+
+        with pytest.raises(OpenBaoDeliveryError, match="did not return an API key"):
+            registrar.register_agent(
+                AgentConfig(name="test-agent"),
+                config_source="s", config_path="agents/test-agent",
+            )
+
+    def test_key_without_key_store_refuses_to_drop_credential(self, stub_hub):
+        registrar = registrar_for(stub_hub, key_store=None)
+
+        with pytest.raises(OpenBaoDeliveryError, match="no OpenBao key store"):
+            registrar.register_agent(
+                AgentConfig(name="test-agent"),
+                config_source="s", config_path="agents/test-agent",
+            )
+
+    def test_check_hub_connection_over_http(self, stub_hub):
+        assert registrar_for(stub_hub).check_hub_connection() is True
+        assert registrar_for(stub_hub, admin_key="wrong-key") \
+            .check_hub_connection() is False
+
+
+class TestEndToEndRegistration:
+    """main() across two local repos, a stub Hub and a stub key store."""
+
+    def test_registration_flow_across_repos(self, tmp_path, monkeypatch, stub_hub):
+        repo_a = build_local_agent_repo(tmp_path / "repo-a", ["native-agent"])
+        repo_b = build_local_agent_repo(tmp_path / "repo-b",
+                                        ["goose-agent", "claude-code-agent"])
+        key_store = StubKeyStore()
+        monkeypatch.setattr(register_agents, "OpenBaoClient",
+                            lambda **kwargs: key_store)
+        monkeypatch.setenv("HUB_ADMIN_KEY", stub_hub.admin_key)
+
+        argv = ["--repo", str(repo_a), "--repo", str(repo_b),
+                "--hub-url", f"http://127.0.0.1:{stub_hub.server_address[1]}",
+                "--output-report", str(tmp_path / "report.json")]
+        assert self._run(monkeypatch, tmp_path, argv) == 0
+        assert sorted(name for name, _ in key_store.delivered) == [
+            "claude-code-agent", "goose-agent", "native-agent",
+        ]
+        results = json.loads((tmp_path / "registration-results.json").read_text())
+        assert {agent["name"] for agent in results["agents"]} == {
+            "native-agent", "goose-agent", "claude-code-agent",
+        }
+        assert all(
+            agent["api_key_ref"] ==
+            f"secret/ardenone-cluster/botburrow/agents/{agent['name']}"
+            for agent in results["agents"]
+        )
+        assert {repo["url"] for repo in results["repositories"]} == {
+            str(repo_a), str(repo_b),
+        }
+
+        # Re-running is idempotent: the Hub re-registers without re-issuing
+        # keys, so no new delivery happens and the run still succeeds.
+        assert self._run(monkeypatch, tmp_path, argv) == 0
+        assert len(key_store.delivered) == 3
+
+    def test_invalid_agent_still_registered_without_strict(
+        self, tmp_path, monkeypatch, stub_hub
+    ):
+        repo = build_local_agent_repo(
+            tmp_path / "repo", ["goose-agent", "Invalid_Agent"])
+        key_store = StubKeyStore()
+        monkeypatch.setattr(register_agents, "OpenBaoClient",
+                            lambda **kwargs: key_store)
+        monkeypatch.setenv("HUB_ADMIN_KEY", stub_hub.admin_key)
+
+        rc = self._run(monkeypatch, tmp_path, [
+            "--repo", str(repo),
+            "--hub-url", f"http://127.0.0.1:{stub_hub.server_address[1]}",
+            "--output-report", str(tmp_path / "report.json"),
+        ])
+
+        # Pins current semantics: without --strict, validation errors are
+        # logged but the agent is still registered. If invalid agents
+        # should never reach the Hub, change the script and this test
+        # together.
+        assert rc == 0
+        assert sorted(name for name, _ in key_store.delivered) == [
+            "Invalid_Agent", "goose-agent",
+        ]
+
+    def test_strict_skips_invalid_agent_and_fails_run(
+        self, tmp_path, monkeypatch, stub_hub
+    ):
+        repo = build_local_agent_repo(
+            tmp_path / "repo", ["goose-agent", "Invalid_Agent"])
+        key_store = StubKeyStore()
+        monkeypatch.setattr(register_agents, "OpenBaoClient",
+                            lambda **kwargs: key_store)
+        monkeypatch.setenv("HUB_ADMIN_KEY", stub_hub.admin_key)
+
+        rc = self._run(monkeypatch, tmp_path, [
+            "--repo", str(repo), "--strict",
+            "--hub-url", f"http://127.0.0.1:{stub_hub.server_address[1]}",
+            "--output-report", str(tmp_path / "report.json"),
+        ])
+
+        # With --strict the invalid agent is skipped and the run fails...
+        assert rc == 1
+        # ...but the valid agent from the same repo was still registered.
+        assert [name for name, _ in key_store.delivered] == ["goose-agent"]
+
+    @staticmethod
+    def _run(monkeypatch, cwd, argv):
+        monkeypatch.chdir(cwd)
+        monkeypatch.setattr(sys, "argv", ["register_agents.py"] + argv)
+        return main()

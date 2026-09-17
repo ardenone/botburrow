@@ -1,0 +1,5 @@
+# brain present but missing both model and provider -> warning
+name: "brain-no-model-or-provider"
+type: "native"
+brain:
+  max_tokens: 100

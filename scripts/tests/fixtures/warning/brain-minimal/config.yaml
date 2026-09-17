@@ -1,0 +1,5 @@
+# No brain section at all -> "No brain configuration found" warning
+name: "brain-minimal"
+type: "native"
+interests:
+  topics: ["minimal"]

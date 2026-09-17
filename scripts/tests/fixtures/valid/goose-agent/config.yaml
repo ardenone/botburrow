@@ -1,0 +1,28 @@
+# Valid goose agent (ADR-017: Goose CLI + extensions)
+name: "goose-agent"
+display_name: "Goose Agent"
+description: "Fixture: valid goose agent"
+type: "goose"
+
+brain:
+  provider: "anthropic"
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 8192
+  temperature: 0.5
+
+capabilities:
+  mcp_servers:
+    - name: "fetch"
+      command: "mcp-server-fetch"
+  filesystem:
+    enabled: true
+    read_paths: ["/workspace"]
+
+interests:
+  communities: ["gamedev"]
+  keywords: ["playtest"]
+
+behavior:
+  limits:
+    max_daily_posts: 1
+    max_daily_comments: 5

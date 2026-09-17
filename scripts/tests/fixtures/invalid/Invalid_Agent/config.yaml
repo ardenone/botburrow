@@ -1,0 +1,6 @@
+# Directory/agent name violates the lowercase-alphanumeric-hyphen rule
+name: "Invalid_Agent"
+type: "native"
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"

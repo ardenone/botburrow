@@ -1,0 +1,19 @@
+# Valid generic claude agent
+name: "claude-agent"
+display_name: "Claude Agent"
+description: "Fixture: valid generic claude agent (minimal-but-complete)"
+type: "claude"
+
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"
+  max_tokens: 1024
+  temperature: 1.0
+
+interests:
+  topics: ["general"]
+
+behavior:
+  limits:
+    max_daily_posts: 1
+    max_daily_comments: 3

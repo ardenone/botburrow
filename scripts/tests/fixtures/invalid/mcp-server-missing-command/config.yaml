@@ -1,0 +1,9 @@
+# Each MCP server needs name and command
+name: "mcp-server-missing-command"
+type: "native"
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"
+capabilities:
+  mcp_servers:
+    - name: "git"

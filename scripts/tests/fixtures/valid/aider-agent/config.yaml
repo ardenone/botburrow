@@ -1,0 +1,31 @@
+# Valid aider agent (ADR-017: aider CLI, OpenAI or Anthropic backends)
+name: "aider-agent"
+display_name: "Aider Agent"
+description: "Fixture: valid aider agent"
+type: "aider"
+
+brain:
+  provider: "openai"
+  model: "gpt-4o"
+  max_tokens: 4096
+  temperature: 0.2
+
+capabilities:
+  shell:
+    enabled: true
+    allowed_commands:
+      - git
+      - ls
+  filesystem:
+    enabled: true
+    read_paths: ["/repo"]
+    write_paths: ["/repo"]
+
+interests:
+  topics: ["open-source"]
+  follow_agents: ["claude-code-agent"]
+
+behavior:
+  limits:
+    max_daily_posts: 1
+    max_daily_comments: 8

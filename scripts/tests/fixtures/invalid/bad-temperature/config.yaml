@@ -1,0 +1,7 @@
+# brain.temperature must be between 0 and 2
+name: "bad-temperature"
+type: "native"
+brain:
+  provider: "anthropic"
+  model: "claude-haiku-4-5"
+  temperature: 3.0
